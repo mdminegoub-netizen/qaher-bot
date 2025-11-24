@@ -1,7 +1,7 @@
 import os
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, time, timezone
 
 from telegram import (
     Update,
@@ -59,6 +59,8 @@ def get_user_record(user_id):
             "streak_start": None,
             "relapses": [],
             "notes": "",
+            "chat_id": None,
+            "daily_enabled": True,  # التذكير اليومي مفعّل افتراضيًا
         }
         save_data(data)
     return data, data[user_key]
@@ -93,6 +95,7 @@ def main_menu_keyboard():
         [KeyboardButton("💡 نصيحة اليوم"), KeyboardButton("🆘 خطة الطوارئ")],
         [KeyboardButton("🧠 أسباب الانتكاس"), KeyboardButton("🕊 أذكار وسكينة")],
         [KeyboardButton("📓 ملاحظاتي"), KeyboardButton("♻️ إعادة ضبط العدّاد")],
+        [KeyboardButton("⏰ تفعيل التذكير اليومي"), KeyboardButton("🔕 إيقاف التذكير اليومي")],
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
@@ -139,26 +142,49 @@ def adhkar_text():
         "• أستغفر الله العظيم وأتوب إليه.\n"
         "• لا حول ولا قوة إلا بالله.\n"
         "• اللهم اغفر لي، وطهّر قلبي، واحفظ فرجي، واصرف عني السوء.\n"
-        "• {قُل لِّلْمُؤْمِنِينَ يَغُضُّوا مِنْ أَبْصَارِهِمْ وَيَحْفَظُوا فُرُوجَهُمْ}.\n\n"
+        "• {قُل لِّلْمُؤْمِنِينَ يَغُضُّوا مِنْ أَبْصَارِهِمْ وَيَحْفَظُوا فُرُوجَهُمْ}.\n\n"
         "كرّرها بتركيز مع تنفّس هادئ، ودع قلبك يهدأ."
     )
+
+
+def daily_message_for_user(user_name, streak_text, note):
+    base = (
+        f"مرحبًا {user_name if user_name else 'يا صديق الرحلة'} 🌿\n\n"
+        "تذكيرك اليومي من *قاهر العادة*:\n\n"
+        f"{streak_text}\n\n"
+    )
+
+    if note:
+        base += f"🎯 تذكّر ملاحظتك الشخصية:\n«{note}»\n\n"
+
+    base += (
+        "اليوم خطوة جديدة في رحلتك، لا تستهين بصمودك حتى لو كان بسيطًا.\n"
+        "ركّز على *خطوة اليوم فقط*، والباقي سيأتي مع الوقت بإذن الله 💪"
+    )
+    return base
 
 
 # ============== أوامر البوت ==============
 
 def start_command(update: Update, context: CallbackContext):
     user = update.effective_user
+    chat_id = update.effective_chat.id
     data, record = get_user_record(user.id)
+
+    # حفظ رقم الشات + تفعيل التذكير اليومي افتراضيًا
+    record["chat_id"] = chat_id
+    record.setdefault("daily_enabled", True)
+
+    if record.get("streak_start") is None:
+        record["streak_start"] = datetime.utcnow().isoformat()
+
+    update_user_record(user.id, record, data)
 
     text = (
         f"أهلًا {user.first_name} 🌿\n\n"
         "هذا بوت *قاهر العادة* لمساعدتك في رحلة الإقلاع عن العادة السرّية.\n"
         "استخدم الأزرار بالأسفل لاختيار ما تحتاجه الآن 👇"
     )
-
-    if record.get("streak_start") is None:
-        record["streak_start"] = datetime.utcnow().isoformat()
-        update_user_record(user.id, record, data)
 
     update.message.reply_text(
         text,
@@ -217,10 +243,43 @@ def note_command(update: Update, context: CallbackContext):
     update.message.reply_text(text, reply_markup=main_menu_keyboard())
 
 
+# ============== التذكير اليومي ==============
+
+def send_daily_reminders(context: CallbackContext):
+    data = load_data()
+    if not data:
+        return
+
+    for user_id, record in data.items():
+        chat_id = record.get("chat_id")
+        daily_enabled = record.get("daily_enabled", True)
+        if not chat_id or not daily_enabled:
+            continue
+
+        # نحاول إحضار الاسم من كاش البوت (لو متوفر)
+        try:
+            user = context.bot.get_chat(chat_id)
+            name = user.first_name
+        except Exception:
+            name = None
+
+        streak_text = format_streak_days(record.get("streak_start"))
+        note = record.get("notes") or ""
+        text = daily_message_for_user(name, streak_text, note)
+
+        try:
+            context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+        except Exception as e:
+            logger.error(f"Failed to send daily message to {chat_id}: {e}")
+
+
+# ============== التعامل مع الرسائل النصية والأزرار ==============
+
 def handle_text_message(update: Update, context: CallbackContext):
     user = update.effective_user
     text = (update.message.text or "").strip()
 
+    # لو المستخدم يكتب ملاحظة جديدة
     if context.user_data.get("awaiting_note"):
         data, record = get_user_record(user.id)
         record["notes"] = text
@@ -232,10 +291,13 @@ def handle_text_message(update: Update, context: CallbackContext):
         )
         return
 
+    # الأزرار
     if text == "🚀 بدء الرحلة":
         return start_command(update, context)
+
     if text == "📅 عدّاد الأيام":
         return streak_command(update, context)
+
     if text == "💡 نصيحة اليوم":
         tips = tips_list()
         idx = datetime.utcnow().day % len(tips)
@@ -244,24 +306,28 @@ def handle_text_message(update: Update, context: CallbackContext):
             reply_markup=main_menu_keyboard(),
         )
         return
+
     if text == "🆘 خطة الطوارئ":
         update.message.reply_text(
             emergency_plan_text(),
             reply_markup=main_menu_keyboard(),
         )
         return
+
     if text == "🧠 أسباب الانتكاس":
         update.message.reply_text(
             reasons_text(),
             reply_markup=main_menu_keyboard(),
         )
         return
+
     if text == "🕊 أذكار وسكينة":
         update.message.reply_text(
             adhkar_text(),
             reply_markup=main_menu_keyboard(),
         )
         return
+
     if text == "📓 ملاحظاتي":
         data, record = get_user_record(user.id)
         note = record.get("notes") or (
@@ -273,9 +339,31 @@ def handle_text_message(update: Update, context: CallbackContext):
             reply_markup=main_menu_keyboard(),
         )
         return
+
     if text == "♻️ إعادة ضبط العدّاد":
         return reset_command(update, context)
 
+    if text == "⏰ تفعيل التذكير اليومي":
+        data, record = get_user_record(user.id)
+        record["daily_enabled"] = True
+        update_user_record(user.id, record, data)
+        update.message.reply_text(
+            "✅ تم تفعيل التذكير اليومي. سأرسل لك رسالة تحفيزية كل يوم بإذن الله.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    if text == "🔕 إيقاف التذكير اليومي":
+        data, record = get_user_record(user.id)
+        record["daily_enabled"] = False
+        update_user_record(user.id, record, data)
+        update.message.reply_text(
+            "🔕 تم إيقاف التذكير اليومي. يمكنك تفعيله مرة أخرى في أي وقت.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    # افتراضيًا
     update.message.reply_text(
         "استخدم الأزرار بالأسفل أو اكتب /help لرؤية الأوامر المتاحة ✅",
         reply_markup=main_menu_keyboard(),
@@ -292,13 +380,23 @@ def main():
     updater = Updater(BOT_TOKEN, use_context=True)
     dp = updater.dispatcher
 
+    # أوامر
     dp.add_handler(CommandHandler("start", start_command))
     dp.add_handler(CommandHandler("help", help_command))
     dp.add_handler(CommandHandler("streak", streak_command))
     dp.add_handler(CommandHandler("reset", reset_command))
     dp.add_handler(CommandHandler("note", note_command))
 
+    # الرسائل النصية
     dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_text_message))
+
+    # التذكير اليومي: كل يوم الساعة 20:00 بتوقيت UTC
+    job_queue = updater.job_queue
+    job_queue.run_daily(
+        send_daily_reminders,
+        time=time(hour=20, minute=0, tzinfo=timezone.utc),
+        name="daily_reminders",
+    )
 
     logger.info("Bot is starting...")
     updater.start_polling()
