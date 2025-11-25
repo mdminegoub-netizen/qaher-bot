@@ -1,7 +1,8 @@
 import os
 import json
 import logging
-from datetime import datetime, time, timezone
+from datetime import datetime, time
+from pytz import utc  # مهم لحل مشكلة التايم زون مع APScheduler
 
 from telegram import (
     Update,
@@ -61,6 +62,8 @@ def get_user_record(user_id):
             "notes": "",
             "chat_id": None,
             "daily_enabled": True,  # التذكير اليومي مفعّل افتراضيًا
+            "name": None,
+            "last_active": None,
         }
         save_data(data)
     return data, data[user_key]
@@ -171,9 +174,11 @@ def start_command(update: Update, context: CallbackContext):
     chat_id = update.effective_chat.id
     data, record = get_user_record(user.id)
 
-    # حفظ رقم الشات + تفعيل التذكير اليومي افتراضيًا
+    # حفظ اسم المستخدم والشات وآخر نشاط
+    record["name"] = user.first_name
     record["chat_id"] = chat_id
     record.setdefault("daily_enabled", True)
+    record["last_active"] = datetime.utcnow().isoformat()
 
     if record.get("streak_start") is None:
         record["streak_start"] = datetime.utcnow().isoformat()
@@ -208,6 +213,9 @@ def help_command(update: Update, context: CallbackContext):
 def streak_command(update: Update, context: CallbackContext):
     user = update.effective_user
     data, record = get_user_record(user.id)
+    record["last_active"] = datetime.utcnow().isoformat()
+    update_user_record(user.id, record, data)
+
     msg = format_streak_days(record.get("streak_start"))
     update.message.reply_text(msg, reply_markup=main_menu_keyboard())
 
@@ -218,6 +226,7 @@ def reset_command(update: Update, context: CallbackContext):
 
     record["streak_start"] = datetime.utcnow().isoformat()
     record.setdefault("relapses", []).append(datetime.utcnow().isoformat())
+    record["last_active"] = datetime.utcnow().isoformat()
     update_user_record(user.id, record, data)
 
     text = (
@@ -232,6 +241,9 @@ def note_command(update: Update, context: CallbackContext):
     user = update.effective_user
     data, record = get_user_record(user.id)
 
+    record["last_active"] = datetime.utcnow().isoformat()
+    update_user_record(user.id, record, data)
+
     current_note = record.get("notes") or "لا توجد ملاحظة بعد."
     text = (
         "📓 ملاحظتك الشخصية عن سبب إقلاعك:\n\n"
@@ -241,6 +253,102 @@ def note_command(update: Update, context: CallbackContext):
     )
     context.user_data["awaiting_note"] = True
     update.message.reply_text(text, reply_markup=main_menu_keyboard())
+
+
+# ============== أوامر إحصائية للإدمن (اختياري) ==============
+
+ADMIN_ID = None  # ضع هنا ID حسابك في تيليجرام إن حبيت تحمي أوامر الإحصائيات
+
+
+def is_admin(user_id: int) -> bool:
+    if ADMIN_ID is None:
+        # لو ما عيّنا ADMIN_ID، نسمح للجميع (يمكنك تغييره لاحقًا)
+        return True
+    return user_id == ADMIN_ID
+
+
+def users_command(update: Update, context: CallbackContext):
+    user = update.effective_user
+    if not is_admin(user.id):
+        return
+
+    data = load_data()
+    if not data:
+        update.message.reply_text("لا يوجد أي مستخدم بدأ استخدام البوت بعد.")
+        return
+
+    text = "📋 قائمة المستخدمين الذين استخدموا البوت:\n\n"
+    for user_id, record in data.items():
+        name = record.get("name") or "بدون اسم"
+        text += f"• {name} — ID: `{user_id}`\n"
+
+    text += f"\nإجمالي المستخدمين: {len(data)} 👥"
+    update.message.reply_text(text, parse_mode="Markdown")
+
+
+def last_active_command(update: Update, context: CallbackContext):
+    user = update.effective_user
+    if not is_admin(user.id):
+        return
+
+    data = load_data()
+    if not data:
+        update.message.reply_text("لا يوجد بيانات نشاط بعد.")
+        return
+
+    # ترتيب المستخدمين حسب آخر نشاط
+    users_list = []
+    for user_id, record in data.items():
+        last = record.get("last_active")
+        if last:
+            try:
+                dt = datetime.fromisoformat(last)
+            except Exception:
+                continue
+            users_list.append((dt, user_id, record))
+
+    if not users_list:
+        update.message.reply_text("لا يوجد نشاط مسجّل بعد.")
+        return
+
+    users_list.sort(reverse=True)
+    users_list = users_list[:10]
+
+    lines = ["🕒 آخر 10 مستخدمين تفاعلوا:\n"]
+    for dt, user_id, record in users_list:
+        name = record.get("name") or "بدون اسم"
+        lines.append(f"• {name} — ID: `{user_id}` — آخر نشاط: {dt.isoformat()}")
+
+    update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+def stats_command(update: Update, context: CallbackContext):
+    user = update.effective_user
+    if not is_admin(user.id):
+        return
+
+    data = load_data()
+    total = len(data)
+    today = datetime.utcnow().date()
+
+    active_today = 0
+    for record in data.values():
+        last = record.get("last_active")
+        if not last:
+            continue
+        try:
+            dt = datetime.fromisoformat(last)
+        except Exception:
+            continue
+        if dt.date() == today:
+            active_today += 1
+
+    text = (
+        "📊 إحصائيات البوت:\n\n"
+        f"- إجمالي المستخدمين: {total} 👥\n"
+        f"- المستخدمون النشطون اليوم: {active_today} ✅\n"
+    )
+    update.message.reply_text(text)
 
 
 # ============== التذكير اليومي ==============
@@ -256,12 +364,11 @@ def send_daily_reminders(context: CallbackContext):
         if not chat_id or not daily_enabled:
             continue
 
-        # نحاول إحضار الاسم من كاش البوت (لو متوفر)
         try:
             user = context.bot.get_chat(chat_id)
             name = user.first_name
         except Exception:
-            name = None
+            name = record.get("name")
 
         streak_text = format_streak_days(record.get("streak_start"))
         note = record.get("notes") or ""
@@ -277,11 +384,14 @@ def send_daily_reminders(context: CallbackContext):
 
 def handle_text_message(update: Update, context: CallbackContext):
     user = update.effective_user
+    data, record = get_user_record(user.id)
+    record["last_active"] = datetime.utcnow().isoformat()
+    update_user_record(user.id, record, data)
+
     text = (update.message.text or "").strip()
 
     # لو المستخدم يكتب ملاحظة جديدة
     if context.user_data.get("awaiting_note"):
-        data, record = get_user_record(user.id)
         record["notes"] = text
         update_user_record(user.id, record, data)
         context.user_data["awaiting_note"] = False
@@ -329,7 +439,6 @@ def handle_text_message(update: Update, context: CallbackContext):
         return
 
     if text == "📓 ملاحظاتي":
-        data, record = get_user_record(user.id)
         note = record.get("notes") or (
             "لا توجد ملاحظة مكتوبة بعد.\n"
             "استخدم الأمر /note أو زر (📓 ملاحظاتي) لإضافتها."
@@ -344,7 +453,6 @@ def handle_text_message(update: Update, context: CallbackContext):
         return reset_command(update, context)
 
     if text == "⏰ تفعيل التذكير اليومي":
-        data, record = get_user_record(user.id)
         record["daily_enabled"] = True
         update_user_record(user.id, record, data)
         update.message.reply_text(
@@ -354,7 +462,6 @@ def handle_text_message(update: Update, context: CallbackContext):
         return
 
     if text == "🔕 إيقاف التذكير اليومي":
-        data, record = get_user_record(user.id)
         record["daily_enabled"] = False
         update_user_record(user.id, record, data)
         update.message.reply_text(
@@ -380,21 +487,26 @@ def main():
     updater = Updater(BOT_TOKEN, use_context=True)
     dp = updater.dispatcher
 
-    # أوامر
+    # أوامر أساسية
     dp.add_handler(CommandHandler("start", start_command))
     dp.add_handler(CommandHandler("help", help_command))
     dp.add_handler(CommandHandler("streak", streak_command))
     dp.add_handler(CommandHandler("reset", reset_command))
     dp.add_handler(CommandHandler("note", note_command))
 
+    # أوامر إحصائية للإدمن
+    dp.add_handler(CommandHandler("users", users_command))
+    dp.add_handler(CommandHandler("last_active", last_active_command))
+    dp.add_handler(CommandHandler("stats", stats_command))
+
     # الرسائل النصية
     dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_text_message))
 
-    # التذكير اليومي: كل يوم الساعة 20:00 بتوقيت UTC
+    # التذكير اليومي: كل يوم الساعة 20:00 UTC (تقدر تغيّرها)
     job_queue = updater.job_queue
     job_queue.run_daily(
         send_daily_reminders,
-        time=time(hour=20, minute=0, tzinfo=timezone.utc),
+        time=time(hour=20, minute=0, tzinfo=utc),
         name="daily_reminders",
     )
 
