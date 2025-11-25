@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+import random
 from datetime import datetime, time
 from pytz import utc  # مهم لحل مشكلة التايم زون مع APScheduler
 
@@ -19,7 +20,6 @@ from telegram.ext import (
 
 # ============== الإعدادات الأساسية ==============
 
-# نقرأ التوكن من متغيّر البيئة BOT_TOKEN في Render
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 DATA_FILE = "user_data.json"
@@ -64,6 +64,8 @@ def get_user_record(user_id):
             "daily_enabled": True,  # التذكير اليومي مفعّل افتراضيًا
             "name": None,
             "last_active": None,
+            "last_tip_index": None,
+            "is_new": True,
         }
         save_data(data)
     return data, data[user_key]
@@ -86,32 +88,43 @@ def format_streak_days(streak_start):
         start_dt = datetime.fromisoformat(streak_start)
     except Exception:
         return "حدث خطأ في قراءة تاريخ البداية، جرّب إعادة ضبط العدّاد بواسطة /reset."
+
     delta = datetime.utcnow() - start_dt
-    days = delta.days
-    hours = delta.seconds // 3600
-    return f"مدّتك الحالية بدون انتكاس: {days} يوم و {hours} ساعة تقريبًا ✅"
+    total_seconds = int(delta.total_seconds())
+    days = total_seconds // 86400
+    hours = (total_seconds % 86400) // 3600
+    minutes = (total_seconds % 3600) // 60
+
+    return (
+        f"مدّتك الحالية بدون انتكاس: {days} يوم، {hours} ساعة، "
+        f"{minutes} دقيقة تقريبًا ✅"
+    )
 
 
 def main_menu_keyboard():
     keyboard = [
         [KeyboardButton("🚀 بدء الرحلة"), KeyboardButton("📅 عدّاد الأيام")],
-        [KeyboardButton("💡 نصيحة اليوم"), KeyboardButton("🆘 خطة الطوارئ")],
+        [KeyboardButton("💡 نصيحة"), KeyboardButton("🆘 خطة الطوارئ")],
         [KeyboardButton("🧠 أسباب الانتكاس"), KeyboardButton("🕊 أذكار وسكينة")],
         [KeyboardButton("📓 ملاحظاتي"), KeyboardButton("♻️ إعادة ضبط العدّاد")],
         [KeyboardButton("⏰ تفعيل التذكير اليومي"), KeyboardButton("🔕 إيقاف التذكير اليومي")],
+        [KeyboardButton("📬 تواصل مع الدعم")],
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 
 def tips_list():
     return [
-        "أغلق مصادر الإثارة من جذورها: حسابات، مواقع، أوقات فراغ بلا هدف.",
-        "عدّاد الأيام يذكّرك أنك تبني عادة جديدة، ليس مجرد رقم.",
-        "ثواني متعة مزيفة = أيام من الندم والتشتّت، تذكّر ذلك لحظة الضعف.",
-        "رياضة 20 دقيقة مشي يوميًا تغيّر حالتك النفسية بالكامل.",
-        "استعن بالدعاء: (اللهم طهّر قلبي واحفظ فرجي واصرف عني السوء والفحشاء).",
-        "اكتب هدفك من الإقلاع: من تريد أن تكون بعد ٣ شهور من الآن؟",
-        "نم مبكرًا؛ أغلب الانتكاسات تحدث ليلًا مع السهر والتعب والوحدة.",
+        "🔹 تذكّر أن اللذة لحظات، لكن أثرها السلبي يبقى في النفس لأيام.",
+        "🔹 كل مرة تقاوم فيها، أنت تقوّي عضلة الإرادة داخلك.",
+        "🔹 اشغل وقت فراغك بما تحب: تعلّم، رياضة، قراءة… الفراغ عدوّك.",
+        "🔹 إدمان العادة ليس أنت، بل عادة تعوّدت عليها… ويمكنك إعادة برمجة نفسك.",
+        "🔹 قل لنفسك: (لن أسمح لهذه العادة أن تسرق مستقبلي وزواجي وطاقتي).",
+        "🔹 ركّز على يوم واحد فقط: (لن أسقط اليوم)، ولا تفكّر في الشهر كامل.",
+        "🔹 أخرج من غرفة النوم أو مكان السقوط المعتاد فورًا عند أول شرارة.",
+        "🔹 بدّل حساباتك ومتابعاتك بكل ما يُعينك على النقاء لا على السقوط.",
+        "🔹 لا تستحي من التوبة مهما كررت الخطأ، استحي أن تستسلم ولا تحاول.",
+        "🔹 كن مع الله في الخفاء، يعنك الله في العلن وفي لحظات الضعف.",
     ]
 
 
@@ -167,6 +180,19 @@ def daily_message_for_user(user_name, streak_text, note):
     return base
 
 
+# ============== إعداد الإدمن ==============
+
+# إذا حاب تكون في أوامر خاصة لك فقط، ضع ID حسابك هنا (تجيبه من /whoami)
+ADMIN_ID = None  # مثال: 123456789
+
+
+def is_admin(user_id: int) -> bool:
+    if ADMIN_ID is None:
+        # لو ما عيّنا ADMIN_ID، نسمح للجميع (تقدّر تعدّلها لاحقًا)
+        return True
+    return user_id == ADMIN_ID
+
+
 # ============== أوامر البوت ==============
 
 def start_command(update: Update, context: CallbackContext):
@@ -174,16 +200,34 @@ def start_command(update: Update, context: CallbackContext):
     chat_id = update.effective_chat.id
     data, record = get_user_record(user.id)
 
-    # حفظ اسم المستخدم والشات وآخر نشاط
+    # حفظ بيانات أساسية
     record["name"] = user.first_name
     record["chat_id"] = chat_id
     record.setdefault("daily_enabled", True)
     record["last_active"] = datetime.utcnow().isoformat()
 
+    new_user = record.get("is_new", False)
+
     if record.get("streak_start") is None:
         record["streak_start"] = datetime.utcnow().isoformat()
 
+    record["is_new"] = False
     update_user_record(user.id, record, data)
+
+    # لو إدمن معرف، بلّغه أن مستخدم جديد دخل البوت
+    if new_user and ADMIN_ID is not None:
+        try:
+            context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=(
+                    "🟢 مستخدم جديد دخل البوت:\n\n"
+                    f"الاسم: {user.first_name}\n"
+                    f"اليوزر: @{user.username if user.username else 'لا يوجد'}\n"
+                    f"ID: {user.id}"
+                ),
+            )
+        except Exception as e:
+            logger.error(f"Failed to notify admin about new user: {e}")
 
     text = (
         f"أهلًا {user.first_name} 🌿\n\n"
@@ -206,8 +250,23 @@ def help_command(update: Update, context: CallbackContext):
         "/streak - عرض عدد أيام الإقلاع\n"
         "/reset - إعادة ضبط العدّاد من اليوم\n"
         "/note - إضافة أو تعديل ملاحظتك الشخصية\n"
+        "/whoami - عرض ID الخاص بك\n"
+        "/users - (للإدمن) قائمة المستخدمين\n"
+        "/last_active - (للإدمن) آخر من تفاعل\n"
+        "/stats - (للإدمن) إحصائيات عامة\n"
     )
     update.message.reply_text(text, reply_markup=main_menu_keyboard())
+
+
+def whoami_command(update: Update, context: CallbackContext):
+    user = update.effective_user
+    text = (
+        f"👤 معلوماتك:\n\n"
+        f"الاسم: {user.first_name}\n"
+        f"اليوزر: @{user.username if user.username else 'لا يوجد'}\n"
+        f"ID: `{user.id}`"
+    )
+    update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
 
 
 def streak_command(update: Update, context: CallbackContext):
@@ -252,20 +311,11 @@ def note_command(update: Update, context: CallbackContext):
         "اكتب ما تريد أن تتذكّره عند لحظة الضعف."
     )
     context.user_data["awaiting_note"] = True
+    context.user_data["awaiting_support"] = False
     update.message.reply_text(text, reply_markup=main_menu_keyboard())
 
 
-# ============== أوامر إحصائية للإدمن (اختياري) ==============
-
-ADMIN_ID = None  # ضع هنا ID حسابك في تيليجرام إن حبيت تحمي أوامر الإحصائيات
-
-
-def is_admin(user_id: int) -> bool:
-    if ADMIN_ID is None:
-        # لو ما عيّنا ADMIN_ID، نسمح للجميع (يمكنك تغييره لاحقًا)
-        return True
-    return user_id == ADMIN_ID
-
+# ============== أوامر إحصائية للإدمن ==============
 
 def users_command(update: Update, context: CallbackContext):
     user = update.effective_user
@@ -296,7 +346,6 @@ def last_active_command(update: Update, context: CallbackContext):
         update.message.reply_text("لا يوجد بيانات نشاط بعد.")
         return
 
-    # ترتيب المستخدمين حسب آخر نشاط
     users_list = []
     for user_id, record in data.items():
         last = record.get("last_active")
@@ -390,7 +439,40 @@ def handle_text_message(update: Update, context: CallbackContext):
 
     text = (update.message.text or "").strip()
 
-    # لو المستخدم يكتب ملاحظة جديدة
+    # أولوية: رسائل الدعم
+    if context.user_data.get("awaiting_support"):
+        context.user_data["awaiting_support"] = False
+        support_text = text
+
+        if ADMIN_ID is not None:
+            try:
+                context.bot.send_message(
+                    chat_id=ADMIN_ID,
+                    text=(
+                        "📬 رسالة دعم جديدة:\n\n"
+                        f"من: {user.first_name} (ID: {user.id})\n"
+                        f"يوزر: @{user.username if user.username else 'لا يوجد'}\n\n"
+                        f"النص:\n{support_text}"
+                    ),
+                )
+                update.message.reply_text(
+                    "✅ تم إرسال رسالتك إلى الدعم. سيتم الرد عليك إذا لزم الأمر بإذن الله.",
+                    reply_markup=main_menu_keyboard(),
+                )
+            except Exception as e:
+                logger.error(f"Failed to forward support message: {e}")
+                update.message.reply_text(
+                    "حدث خطأ أثناء إرسال رسالتك إلى الدعم، حاول لاحقًا.",
+                    reply_markup=main_menu_keyboard(),
+                )
+        else:
+            update.message.reply_text(
+                "حاليًا لا يوجد دعم مباشر مفعّل في هذا البوت.",
+                reply_markup=main_menu_keyboard(),
+            )
+        return
+
+    # أولوية: ملاحظات
     if context.user_data.get("awaiting_note"):
         record["notes"] = text
         update_user_record(user.id, record, data)
@@ -408,11 +490,19 @@ def handle_text_message(update: Update, context: CallbackContext):
     if text == "📅 عدّاد الأيام":
         return streak_command(update, context)
 
-    if text == "💡 نصيحة اليوم":
+    if text == "💡 نصيحة":
         tips = tips_list()
-        idx = datetime.utcnow().day % len(tips)
+        last_index = record.get("last_tip_index")
+        # اختيار عشوائي مختلف عن آخر نصيحة إن أمكن
+        available_indices = list(range(len(tips)))
+        if last_index is not None and last_index in available_indices and len(available_indices) > 1:
+            available_indices.remove(last_index)
+        new_index = random.choice(available_indices)
+        record["last_tip_index"] = new_index
+        update_user_record(user.id, record, data)
+
         update.message.reply_text(
-            f"💡 نصيحة اليوم:\n\n{tips[idx]}",
+            f"{tips[new_index]}",
             reply_markup=main_menu_keyboard(),
         )
         return
@@ -470,6 +560,16 @@ def handle_text_message(update: Update, context: CallbackContext):
         )
         return
 
+    if text == "📬 تواصل مع الدعم":
+        context.user_data["awaiting_support"] = True
+        context.user_data["awaiting_note"] = False
+        update.message.reply_text(
+            "✉️ اكتب الآن رسالتك التي تريد إرسالها إلى الدعم.\n"
+            "اكتب سؤالًا أو استفسارًا أو طلب نصيحة، وسأرسلها لصاحب البوت.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
     # افتراضيًا
     update.message.reply_text(
         "استخدم الأزرار بالأسفل أو اكتب /help لرؤية الأوامر المتاحة ✅",
@@ -493,6 +593,7 @@ def main():
     dp.add_handler(CommandHandler("streak", streak_command))
     dp.add_handler(CommandHandler("reset", reset_command))
     dp.add_handler(CommandHandler("note", note_command))
+    dp.add_handler(CommandHandler("whoami", whoami_command))
 
     # أوامر إحصائية للإدمن
     dp.add_handler(CommandHandler("users", users_command))
@@ -502,7 +603,7 @@ def main():
     # الرسائل النصية
     dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_text_message))
 
-    # التذكير اليومي: كل يوم الساعة 20:00 UTC (تقدر تغيّرها)
+    # التذكير اليومي: كل يوم الساعة 20:00 UTC
     job_queue = updater.job_queue
     job_queue.run_daily(
         send_daily_reminders,
