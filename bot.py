@@ -183,7 +183,7 @@ def daily_message_for_user(user_name, streak_text, note):
 # ============== إعداد الإدمن ==============
 
 # إذا حاب تكون في أوامر خاصة لك فقط، ضع ID حسابك هنا (تجيبه من /whoami)
-ADMIN_ID = None  # مثال: 931350292
+ADMIN_ID = 931350292
 
 
 def is_admin(user_id: int) -> bool:
