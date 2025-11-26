@@ -5,6 +5,7 @@ import random
 from datetime import datetime, timezone, timedelta, time
 from threading import Thread
 
+import pytz
 from flask import Flask
 
 from telegram import (
@@ -28,16 +29,19 @@ DATA_FILE = "user_data.json"
 
 # ضع هنا ID الأدمن (بدون علامات تنصيص)
 # مثال: ADMIN_ID = 931350292
-ADMIN_ID = 931350292  # عدّل هذا للـ ID تبعك لو حاب
+ADMIN_ID = 931350292  # عدّل هذا للـ ID تبعك
 
-# حالات خاصة بالمستخدمين
-WAITING_FOR_SUPPORT = set()          # يكتب رسالة دعم
-WAITING_FOR_BROADCAST = set()       # الأدمن يكتب رسالة جماعية
-WAITING_FOR_SET_START = set()       # يكتب عدد الأيام لبداية التعافي
-WAITING_FOR_RATING = set()          # يكتب تقييم اليوم
+# مستخدمون في وضع "تواصل مع الدعم"
+WAITING_FOR_SUPPORT = set()
 
-# ربط رسالة الدعم عند الأدمن بالمستخدم الأصلي (للرد بالـ Reply)
-ADMIN_INBOX = {}  # key: admin_message_id -> user_id
+# الأدمن في وضع "رسالة جماعية"
+WAITING_FOR_BROADCAST = set()
+
+# مستخدمون في وضع "تعيين بداية التعافي"
+WAITING_FOR_CUSTOM_START = set()
+
+# خريطة لربط رسالة الدعم عند الأدمن بالمستخدم الأصلي (للرد عبر Reply)
+ADMIN_REPLY_MAP: dict[int, int] = {}
 
 # ملف اللوج
 logging.basicConfig(
@@ -87,27 +91,26 @@ data = load_data()
 
 def get_user_record(user: "telegram.User"):
     user_id = str(user.id)
-    now_iso = datetime.now(timezone.utc).isoformat()
-
     if user_id not in data:
+        now = datetime.now(timezone.utc).isoformat()
         data[user_id] = {
             "user_id": user.id,
             "first_name": user.first_name,
             "username": user.username,
-            "created_at": now_iso,
-            "last_active": now_iso,
+            "created_at": now,
+            "last_active": now,
             "streak_start": None,
             "notes": [],
-            "ratings": [],  # [{date: 'YYYY-MM-DD', score: int}]
+            "ratings": [],  # تقييم اليوم
         }
         save_data(data)
     else:
+        # تحديث آخر نشاط + اسم المستخدم لو تغيّر
         record = data[user_id]
-        record["last_active"] = now_iso
+        record["last_active"] = datetime.now(timezone.utc).isoformat()
         record["first_name"] = user.first_name
         record["username"] = user.username
         save_data(data)
-
     return data[user_id]
 
 
@@ -125,28 +128,9 @@ def get_all_user_ids():
 
 
 def is_admin(user_id: int) -> bool:
-    """
-    يحدد هل المستخدم أدمن أم لا:
-    1) لو ADMIN_ID مضبوط ويطابق user_id → أدمن.
-    2) لو ما فيه ADMIN_ID صحيح → أول مستخدم دخل البوت يُعتبر الأدمن.
-    """
-    try:
-        if ADMIN_ID is not None and user_id == ADMIN_ID:
-            return True
-
-        # fallback: أول مستخدم في الداتا
-        if data:
-            owner = sorted(
-                data.values(),
-                key=lambda r: r.get("created_at", "")
-            )[0]
-            owner_id = owner.get("user_id")
-            if owner_id and user_id == owner_id:
-                return True
-    except Exception as e:
-        logger.error(f"Error checking admin: {e}")
-
-    return False
+    if ADMIN_ID is None:
+        return False
+    return user_id == ADMIN_ID
 
 # =================== حساب مدة الثبات ===================
 
@@ -167,23 +151,26 @@ def get_streak_delta(record) -> timedelta | None:
 
 
 def format_streak_text(delta: timedelta) -> str:
-    # نحسب دائماً (شهر، يوم، ساعة، دقيقة) حتى لو صفر
     total_minutes = int(delta.total_seconds() // 60)
+    total_hours = int(delta.total_seconds() // 3600)
+    total_days = int(delta.total_seconds() // 86400)
+    # تقريب الأشهر على أساس 30 يوماً
+    months = total_days // 30
+    days = total_days % 30
+    hours = total_hours % 24
+    minutes = total_minutes % 60
 
-    minutes_in_hour = 60
-    minutes_in_day = 24 * minutes_in_hour
-    minutes_in_month = 30 * minutes_in_day  # تقريباً
+    parts = []
+    if months:
+        parts.append(f"{months} شهر")
+    if days:
+        parts.append(f"{days} يوم")
+    if hours:
+        parts.append(f"{hours} ساعة")
+    if minutes or not parts:
+        parts.append(f"{minutes} دقيقة")
 
-    months = total_minutes // minutes_in_month
-    rem = total_minutes % minutes_in_month
-
-    days = rem // minutes_in_day
-    rem = rem % minutes_in_day
-
-    hours = rem // minutes_in_hour
-    minutes = rem % minutes_in_hour
-
-    return f"{months} شهر، {days} يوم، {hours} ساعة، {minutes} دقيقة"
+    return "، ".join(parts)
 
 # =================== الأزرار الرئيسية ===================
 
@@ -195,11 +182,11 @@ BTN_RELAPSE = "أسباب الانتكاس 🧠"
 BTN_DHIKR = "أذكار وسكينة 🕊"
 BTN_NOTES = "ملاحظاتي 📓"
 BTN_RESET = "إعادة ضبط العداد ♻️"
-BTN_RATING = "تقييم اليوم ⭐️"
+BTN_RATE_DAY = "تقييم اليوم ⭐"
 BTN_LEVEL = "مستواي 💎"
 BTN_ACCOUNT = "معرفة حسابي 👤"
 BTN_SUPPORT = "تواصل مع الدعم ✉️"
-BTN_SET_START = "تعيين بداية التعافي ⏰"
+BTN_SET_RECOVERY_START = "تعيين بداية التعافي ⏰"
 BTN_HELP = "مساعدة ℹ️"
 BTN_BROADCAST = "رسالة جماعية 📢"
 BTN_STATS = "عدد المستخدمين 👥"
@@ -210,10 +197,10 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
         [KeyboardButton(BTN_TIP), KeyboardButton(BTN_EMERGENCY)],
         [KeyboardButton(BTN_RELAPSE), KeyboardButton(BTN_DHIKR)],
         [KeyboardButton(BTN_NOTES), KeyboardButton(BTN_RESET)],
-        [KeyboardButton(BTN_RATING), KeyboardButton(BTN_LEVEL)],
+        [KeyboardButton(BTN_RATE_DAY), KeyboardButton(BTN_LEVEL)],
         [KeyboardButton(BTN_ACCOUNT), KeyboardButton(BTN_SUPPORT)],
-        [KeyboardButton(BTN_SET_START), KeyboardButton(BTN_HELP)],
-        [KeyboardButton(BTN_BROADCAST), KeyboardButton(BTN_STATS)],
+        [KeyboardButton(BTN_SET_RECOVERY_START), KeyboardButton(BTN_HELP)],
+        [KeyboardButton(BTN_STATS), KeyboardButton(BTN_BROADCAST)],
     ],
     resize_keyboard=True,
 )
@@ -221,47 +208,52 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
 # =================== رسائل جاهزة ===================
 
 TIPS = [
-    "💡 جرّب تبدأ يومك بدون هاتف أول 30 دقيقة… هذا يعطيك قوة تحكم في نفسك طول اليوم.",
-    "💡 كل مرة تقول (لا) للعادة، أنت تبني احترامك لنفسك وتقرّب من النسخة اللي تحلم تكونها.",
-    "💡 غيّر مكانك فور ما تحس بضعف: قم، تحرك، اغسل وجهك… الحركة تكسر الموجة.",
-    "💡 راقب أفكارك قبل الانتكاس… غالباً تبدأ بفكرة صغيرة؛ أوقفها من أول لحظة.",
-    "💡 أحط نفسك بأهداف يومية بسيطة: قراءة، رياضة خفيفة، تعلم شيء جديد.",
-    "💡 لو تعبت لا تكره نفسك… اعتبر التعب إشارة للراحة وليس مبررًا للانتكاس.",
-    "💡 التقدم الحقيقي هو أن تكون اليوم أفضل من أمس ولو بنسبة 1٪ فقط.",
-    "💡 دوّن إنجازاتك الصغيرة في ملاحظاتك… سترى أنك أقوى مما تتخيل.",
-]
-
-ADHKAR_LIST = [
-    "🕊 *لحظة سكينة:*\n\n«أستغفر الله العظيم وأتوب إليه» ١٠ مرات… قلها بتركيز واستشعار، وليس بسرعة فقط.",
-    "🕊 *راحة قلب:*\n\n«لا إله إلا أنت سبحانك إني كنت من الظالمين» ٣ مرات… هذه دعوة يونس عليه السلام في الكرب.",
-    "🕊 *طمأنينة:*\n\n«حسبي الله لا إله إلا هو عليه توكلت وهو رب العرش العظيم» ٧ مرات.",
-    "🕊 *هدوء قبل النوم:*\n\nاقرأ آية الكرسي وسورة الإخلاص والمعوذتين بنية الحفظ والستر.",
-]
-
-RELAPSE_LIST = [
-    "🧠 *سبب شائع للانتكاس:* استخدام الهاتف في السرير مع إضاءة خافتة.\nالحل: اجعل الشحن بعيدًا عن السرير واغلق الإنترنت قبل النوم.",
-    "🧠 *سبب شائع:* الفراغ الطويل بدون خطة لليوم.\nالحل: اكتب ٣ مهام فقط لليوم ونفذها مهما كان مزاجك.",
-    "🧠 *سبب شائع:* الإحباط والشعور أن (ما في أمل).\nالحل: تذكّر أن كل بطل مرّ بفترات سقوط، لكن الفارق أنه استمر بالقيام.",
-    "🧠 *سبب شائع:* متابعة محتوى (خفيف) لكنه يلمّح للإثارة.\nالحل: كن حازمًا؛ احذف المصادر المريبة ولو كانت مشهورة.",
+    "💡 تذكّر: كل دقيقة تصبر فيها تبني نسخة أقوى من نفسك.",
+    "💡 غيّر مكانك فوراً لما تحس بالضعف، الحركة تكسر موجة العادة.",
+    "💡 اشغل يدك بشي نافع: كتابة، قراءة، تمارين بسيطة، أو ترتيب غرفتك.",
+    "💡 قل لنفسك: «هذه الرغبة مؤقتة، لكن فخري بنفسي لو صبرت رح يبقى طويل» 💪.",
+    "💡 قلّل العزلة، وجود الناس حولك يقلل فرص السقوط بشكل كبير.",
 ]
 
 EMERGENCY_PLAN = (
-    "🆘 *خطة الطوارئ عند لحظة الضعف:*\n"
-    "1️⃣ غيّر وضع جسمك فورًا (انهض/اجلس/تحرك).\n"
-    "2️⃣ اخرج من المكان الذي يثيرك ولو لخمس دقائق في الهواء.\n"
-    "3️⃣ خذ 10 أنفاس عميقة ببطء… شهيق 4 ثوانٍ، حبس 4، زفير 4.\n"
-    "4️⃣ افتح زر «أذكار وسكينة 🕊» أو «نصيحة 💡» وخذ دفعة معنوية.\n"
-    "5️⃣ اكتب شعورك الآن في «ملاحظاتي 📓» بدل ما تكتمه بداخلك.\n"
+    "🆘 *خطة الطوارئ لحظة الضعف:*\n"
+    "1️⃣ غيّر وضع جسمك فورًا (انهض من السرير، اجلس، تحرك).\n"
+    "2️⃣ اترك الجهاز أو المكان المثير ولو لخمس دقائق.\n"
+    "3️⃣ خذ نفسًا عميقًا 10 مرات ببطء وركّز على الشهيق والزفير.\n"
+    "4️⃣ افتح قسم «أذكار وسكينة 🕊» أو استمع لسورة تحبها.\n"
+    "5️⃣ اكتب شعورك الآن في «ملاحظاتي 📓» بدل ما تكبته.\n"
+    "أهم شيء: *لا تبقى وحدك مع الفكرة* 🔥."
 )
+
+RELAPSE_TEXTS = [
+    "🧠 *سبب شائع للانتكاس: الفراغ.*\nحاول تملأ يومك بشيء واضح: دراسة، عمل، رياضة، قراءة، أو مشروع صغير.",
+    "🧠 *سبب شائع للانتكاس: استخدام الهاتف في السرير.*\nحاول تخلي السرير للنوم فقط، والهاتف بعيد عنك قبل النوم.",
+    "🧠 *سبب شائع للانتكاس: المحتوى المثير (حتى لو كان عادي ظاهريًا).*\nنظّف حساباتك وتتبع من تشوف، خلك شجاع في الحظر والإلغاء.",
+    "🧠 *سبب شائع للانتكاس: العزلة.*\nقابل ناس، كل مع أهلك، اطلع تمشى، لا تبقى لحالك وقت طويل.",
+]
+
+ADHKAR_TEXTS = [
+    "🕊 *جرعة سكينة سريعة:*\n\n"
+    "• أستغفر الله العظيم وأتوب إليه.\n"
+    "• لا إله إلا أنت سبحانك إني كنت من الظالمين.\n"
+    "• حسبي الله لا إله إلا هو عليه توكلت وهو رب العرش العظيم.\n\n"
+    "ردّدها بهدوء مع تنفس عميق 🌿.",
+    "🕊 *اذكر الله الآن:* \n\n"
+    "سبحان الله ✨\n"
+    "الحمد لله 🤍\n"
+    "لا إله إلا الله 🌙\n"
+    "الله أكبر 💫\n\n"
+    "20 مرة من كل ذكر تغيّر مزاجك بالكامل إن شاء الله.",
+]
 
 HELP_TEXT = (
     "ℹ️ *مساعدة سريعة:*\n\n"
-    "• ابدأ من زر «بدء الرحلة 🚀» ليبدأ العداد.\n"
-    "• زر «عداد الأيام 🗓» يعرض لك مدة ثباتك (شهر/يوم/ساعة/دقيقة).\n"
-    "• لو كنت ثابتًا من قبل، استخدم «تعيين بداية التعافي ⏰» لتحديد الأيام السابقة.\n"
-    "• «تقييم اليوم ⭐️» يساعدك تراجع نفسك في نهاية اليوم.\n"
-    "• لو احتجت شخص يسمعك، استخدم «تواصل مع الدعم ✉️» واكتب ما تشاء.\n\n"
-    "أنا هنا لأمشي معك خطوة خطوة يا بطل 🤍"
+    "• «بدء الرحلة 🚀»: يبدأ عدّاد ثباتك من الآن.\n"
+    "• «عداد الأيام 🗓»: يريك كم مضى من وقت ثباتك (أشهر، أيام، ساعات، دقائق).\n"
+    "• «تعيين بداية التعافي ⏰»: لو كنت ثابت من قبل اليوم وتريد ضبط البداية يدويًا.\n"
+    "• «إعادة ضبط العداد ♻️»: لو حصلت انتكاسة وتريد بداية جديدة.\n"
+    "• «تواصل مع الدعم ✉️»: تتواصل معي مباشرة وتقدر أحيانًا أجاوبك على موقفك الخاص.\n\n"
+    "أي وقت تضيع، ارجع للأزرار واختَر اللي يناسب حالتك الآن 💪."
 )
 
 # =================== أوامر البوت ===================
@@ -269,7 +261,29 @@ HELP_TEXT = (
 
 def start_command(update: Update, context: CallbackContext):
     user = update.effective_user
-    get_user_record(user)
+
+    # نتحقق: هل هذا أول دخول للمستخدم؟
+    is_new_user = str(user.id) not in data
+
+    # نسجّل/نحدّث بياناته كالمعتاد
+    record = get_user_record(user)
+
+    # لو مستخدم جديد → نرسل إشعار للأدمن
+    if is_new_user and ADMIN_ID is not None:
+        try:
+            context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=(
+                    "🆕 مستخدم جديد دخل البوت!\n\n"
+                    f"👤 الاسم: {user.full_name}\n"
+                    f"🆔 ID: `{user.id}`\n"
+                    f"🔹 اسم المستخدم: @{user.username if user.username else 'لا يوجد'}\n"
+                    f"📅 وقت التسجيل (UTC): {record.get('created_at')}"
+                ),
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            logger.error(f"Error notifying admin about new user: {e}")
 
     text = (
         f"أهلاً {user.first_name} 🌱\n\n"
@@ -281,7 +295,11 @@ def start_command(update: Update, context: CallbackContext):
 
 
 def help_command(update: Update, context: CallbackContext):
-    update.message.reply_text(HELP_TEXT, reply_markup=MAIN_KEYBOARD, parse_mode="Markdown")
+    update.message.reply_text(
+        HELP_TEXT,
+        reply_markup=MAIN_KEYBOARD,
+        parse_mode="Markdown",
+    )
 
 # =================== وظائف الأزرار ===================
 
@@ -290,20 +308,25 @@ def handle_start_journey(update: Update, context: CallbackContext):
     user = update.effective_user
     record = get_user_record(user)
 
-    delta = get_streak_delta(record)
-    if delta:
-        human = format_streak_text(delta)
-        update.message.reply_text(
-            f"🚀 رحلتك بدأت من قبل.\nمدة ثباتك الحالية:\n{human}",
-            reply_markup=MAIN_KEYBOARD,
-        )
-        return
+    # لو كان عنده بداية من قبل، نذكّره فقط
+    if record.get("streak_start"):
+        delta = get_streak_delta(record)
+        if delta:
+            human = format_streak_text(delta)
+            update.message.reply_text(
+                f"🚀 رحلتك بدأت من قبل.\nمدة ثباتك الحالية: {human}.",
+                reply_markup=MAIN_KEYBOARD,
+            )
+            return
 
+    # بداية جديدة
     now = datetime.now(timezone.utc).isoformat()
     update_user_record(user.id, streak_start=now)
 
     update.message.reply_text(
-        "🚀 انطلاقة جديدة!\nتم بدء رحلتك، ومن الآن سيبدأ حساب مدة ثباتك 🤍",
+        "🚀 تم بدء رحلتك بنجاح!\n"
+        "من الآن سيتم حساب مدة ثباتك عن آخر انتكاسة.\n"
+        "شد حيلك، كل لحظة صبر ترفع مستواك 💪",
         reply_markup=MAIN_KEYBOARD,
     )
 
@@ -316,7 +339,7 @@ def handle_days_counter(update: Update, context: CallbackContext):
     if not delta:
         update.message.reply_text(
             "لم تبدأ رحلتك بعد.\n"
-            "اضغط على زر «بدء الرحلة 🚀» أو استخدم «تعيين بداية التعافي ⏰».",
+            "اضغط على زر «بدء الرحلة 🚀» لبدء العداد.",
             reply_markup=MAIN_KEYBOARD,
         )
         return
@@ -330,7 +353,9 @@ def handle_days_counter(update: Update, context: CallbackContext):
 
 def handle_tip(update: Update, context: CallbackContext):
     tip = random.choice(TIPS)
-    update.message.reply_text(tip, reply_markup=MAIN_KEYBOARD)
+    update.message.reply_text(
+        f"💡 نصيحة تحفيزية:\n{tip}", reply_markup=MAIN_KEYBOARD
+    )
 
 
 def handle_emergency(update: Update, context: CallbackContext):
@@ -340,13 +365,17 @@ def handle_emergency(update: Update, context: CallbackContext):
 
 
 def handle_relapse_reasons(update: Update, context: CallbackContext):
-    msg = random.choice(RELAPSE_LIST)
-    update.message.reply_text(msg, reply_markup=MAIN_KEYBOARD, parse_mode="Markdown")
+    text = random.choice(RELAPSE_TEXTS)
+    update.message.reply_text(
+        text, reply_markup=MAIN_KEYBOARD, parse_mode="Markdown"
+    )
 
 
 def handle_adhkar(update: Update, context: CallbackContext):
-    msg = random.choice(ADHKAR_LIST)
-    update.message.reply_text(msg, reply_markup=MAIN_KEYBOARD, parse_mode="Markdown")
+    text = random.choice(ADHKAR_TEXTS)
+    update.message.reply_text(
+        text, reply_markup=MAIN_KEYBOARD, parse_mode="Markdown"
+    )
 
 
 def handle_notes(update: Update, context: CallbackContext):
@@ -357,14 +386,14 @@ def handle_notes(update: Update, context: CallbackContext):
     if not notes:
         update.message.reply_text(
             "📓 لا توجد ملاحظات بعد.\n"
-            "أرسل أي جملة تشعر بها الآن وسأحفظها لك كملاحظة.",
+            "أرسل لي أي جملة تريد حفظها، وأنا سأضيفها إلى ملاحظاتك.",
             reply_markup=MAIN_KEYBOARD,
         )
     else:
-        joined = "\n\n".join(f"• {n}" for n in notes[-20:])
+        joined = "\n\n".join(f"• {n}" for n in notes[-20:])  # آخر 20 ملاحظة
         update.message.reply_text(
             f"📓 آخر ملاحظاتك:\n\n{joined}\n\n"
-            "أرسل رسالة جديدة لإضافة ملاحظة أخرى.",
+            "أرسل ملاحظة جديدة لأي فكرة أو شعور تريد حفظه.",
             reply_markup=MAIN_KEYBOARD,
         )
 
@@ -373,10 +402,11 @@ def handle_reset_counter(update: Update, context: CallbackContext):
     user = update.effective_user
     record = get_user_record(user)
 
+    # لو أصلاً ما عنده بداية
     if not record.get("streak_start"):
         update.message.reply_text(
             "العداد لم يُضبط بعد.\n"
-            "ابدأ من زر «بدء الرحلة 🚀» أو «تعيين بداية التعافي ⏰».",
+            "يمكنك البدء من جديد عبر زر «بدء الرحلة 🚀».",
             reply_markup=MAIN_KEYBOARD,
         )
         return
@@ -386,52 +416,58 @@ def handle_reset_counter(update: Update, context: CallbackContext):
 
     update.message.reply_text(
         "♻️ تم إعادة ضبط العداد.\n"
-        "ابدأ من هذه اللحظة بقلب أقوى وعزيمة أنضج 💪",
+        "اعتبرها بداية جديدة أقوى بإذن الله، ولا تيأس أبدًا 🤍.",
         reply_markup=MAIN_KEYBOARD,
     )
 
 
-def handle_rating_button(update: Update, context: CallbackContext):
+def handle_rate_day(update: Update, context: CallbackContext):
     user = update.effective_user
-    get_user_record(user)
-
-    WAITING_FOR_RATING.add(user.id)
+    record = get_user_record(user)
     update.message.reply_text(
-        "⭐️ قيّم يومك من 1 إلى 10 (1 سيء جدًا، 10 ممتاز).\n"
-        "أرسل رقمًا واحدًا فقط.",
-        reply_markup=ReplyKeyboardRemove(),
+        "⭐ قيّم يومك من 1 إلى 5 في رسالة واحدة.\n"
+        "1 = يوم صعب جدًا\n"
+        "5 = يوم ممتاز مليان إنجاز ✨",
+        reply_markup=MAIN_KEYBOARD,
     )
+    # نخزن أنه ينتظر تقييم (نستخدم نفس حقل ratings للتخزين فقط)
+    record.setdefault("waiting_for_rating", True)
+    save_data(data)
 
 
 def handle_level(update: Update, context: CallbackContext):
     user = update.effective_user
     record = get_user_record(user)
-
     delta = get_streak_delta(record)
+
     if not delta:
         update.message.reply_text(
-            "لم تبدأ رحلتك بعد، لذلك لا يوجد مستوى حاليًا.\n"
-            "ابدأ من زر «بدء الرحلة 🚀».",
+            "لسه ما عندك مستوى لأنك ما بدأت الرحلة.\n"
+            "ابدأ عبر زر «بدء الرحلة 🚀».",
             reply_markup=MAIN_KEYBOARD,
         )
         return
 
-    days = int(delta.total_seconds() // 86400)
-    if days < 7:
-        level = "مبتدئ 🔰"
+    days = delta.days
+    if days < 3:
+        level = "مبتدئ 🌱"
+        msg = "بداية بطلة! ركّز على أول أسبوع ولا تستعجل النتائج."
+    elif days < 7:
+        level = "صامد 💪"
+        msg = "أسبوعك هذا مهم جدًا، حاول تقلل محفزاتك لأقصى درجة."
     elif days < 30:
-        level = "مقاتل 💪"
-    elif days < 90:
-        level = "صامد 🛡"
+        level = "مقاتل 🔥"
+        msg = "دخلت مرحلة التغيير الحقيقي، لا تسمح لانتكاسة واحدة تهدم كل شيء."
     else:
         level = "أسطورة التعافي 🏆"
+        msg = "ما شاء الله! خلي نيتك ثابتة، وساعد غيرك إذا قدرت."
 
-    human = format_streak_text(delta)
     update.message.reply_text(
         f"💎 مستواك الحالي: *{level}*\n"
-        f"⏱ مدة ثباتك: {human}",
-        reply_markup=MAIN_KEYBOARD,
+        f"مرّ من ثباتك تقريبًا: {days} يوم.\n\n"
+        f"{msg}",
         parse_mode="Markdown",
+        reply_markup=MAIN_KEYBOARD,
     )
 
 
@@ -439,53 +475,52 @@ def handle_account_info(update: Update, context: CallbackContext):
     user = update.effective_user
     record = get_user_record(user)
 
-    created = record.get("created_at")
-    try:
-        created_dt = datetime.fromisoformat(created).astimezone(timezone.utc)
-        created_text = created_dt.strftime("%Y-%m-%d %H:%M UTC")
-    except Exception:
-        created_text = created
+    created_at = record.get("created_at")
+    streak_start = record.get("streak_start") or "لم تبدأ بعد"
+    username = f"@{user.username}" if user.username else "لا يوجد"
 
     text = (
-        "👤 *بيانات حسابك في البوت:*\n\n"
+        "👤 *معلومات حسابك في البوت:*\n\n"
         f"• الاسم: {user.full_name}\n"
+        f"• اسم المستخدم: {username}\n"
         f"• ID: `{user.id}`\n"
-        f"• اسم المستخدم: @{user.username if user.username else 'لا يوجد'}\n"
-        f"• تاريخ أول استخدام للبوت: {created_text}"
+        f"• تاريخ أول دخول (UTC): {created_at}\n"
+        f"• بداية آخر رحلة تعافي (UTC): {streak_start}\n"
     )
 
-    update.message.reply_text(text, reply_markup=MAIN_KEYBOARD, parse_mode="Markdown")
+    if is_admin(user.id):
+        total_users = len(get_all_user_ids())
+        text += f"\n📊 *أنت الأدمن.* عدد المستخدمين الحاليين: *{total_users}*"
 
-
-def handle_set_start_button(update: Update, context: CallbackContext):
-    user = update.effective_user
-    get_user_record(user)
-
-    WAITING_FOR_SET_START.add(user.id)
     update.message.reply_text(
-        "⏰ اكتب عدد الأيام التي أنت ثابت فيها بدون انتكاس حتى الآن.\n"
-        "مثال: لو لك أسبوع نظيف ارسل: 7",
-        reply_markup=ReplyKeyboardRemove(),
+        text, parse_mode="Markdown", reply_markup=MAIN_KEYBOARD
     )
-
-
-def handle_help_button(update: Update, context: CallbackContext):
-    update.message.reply_text(HELP_TEXT, reply_markup=MAIN_KEYBOARD, parse_mode="Markdown")
-
-# ====== تواصل مع الدعم / رسالة جماعية / إحصائيات ======
 
 
 def handle_contact_support(update: Update, context: CallbackContext):
     user = update.effective_user
-    get_user_record(user)
-
     WAITING_FOR_SUPPORT.add(user.id)
 
+    # نخفي الكيبورد حتى يكتب رسالته براحة
     update.message.reply_text(
         "✉️ اكتب الآن رسالتك التي تريد إرسالها للدعم.\n"
-        "سأرسلها للأدمن مع معلومات حسابك.\n\n"
-        "اكتب ما تشعر به بحرية يا بطل 🤍",
+        "اكتب بارتياح، لن يرى رسالتك أحد غير الأدمن.\n\n"
+        "بعد الإرسال ستصلك رسالة تأكيد ✅",
         reply_markup=ReplyKeyboardRemove(),
+    )
+
+
+def handle_set_recovery_start_button(update: Update, context: CallbackContext):
+    user = update.effective_user
+    WAITING_FOR_CUSTOM_START.add(user.id)
+    update.message.reply_text(
+        "⏰ جميل إن عندك ثبات من قبل!\n"
+        "أرسل الآن عدد *الأيام* التي كنت فيها ثابتًا قبل اليوم.\n\n"
+        "مثال:\n"
+        "لو أنت ثابت من أسبوع → أرسل: 7\n"
+        "لو ثابت من 30 يوم → أرسل: 30",
+        reply_markup=MAIN_KEYBOARD,
+        parse_mode="Markdown",
     )
 
 
@@ -500,7 +535,7 @@ def handle_broadcast_button(update: Update, context: CallbackContext):
     WAITING_FOR_BROADCAST.add(user.id)
     update.message.reply_text(
         "📢 اكتب الآن الرسالة التي تريد إرسالها لجميع مستخدمي البوت.",
-        reply_markup=ReplyKeyboardRemove(),
+        reply_markup=MAIN_KEYBOARD,
     )
 
 
@@ -519,54 +554,37 @@ def handle_stats_button(update: Update, context: CallbackContext):
         reply_markup=MAIN_KEYBOARD,
     )
 
-# =================== تذكير يومي ===================
-
-
-def send_daily_reminders(context: CallbackContext):
-    logger.info("Running daily reminders job...")
-    user_ids = get_all_user_ids()
-    for uid in user_ids:
-        try:
-            context.bot.send_message(
-                chat_id=uid,
-                text=(
-                    "🤍 تذكير لطيف:\n"
-                    "أنت أقوى من العادة… خطوة صغيرة اليوم أفضل من لا شيء.\n"
-                    "لو احتجت دفعة، استخدم أحد الأزرار بالأسفل ✨"
-                ),
-            )
-        except Exception as e:
-            logger.error(f"Error sending daily reminder to {uid}: {e}")
-
 # =================== هاندلر الرسائل العامة ===================
 
 
 def handle_text_message(update: Update, context: CallbackContext):
     user = update.effective_user
-    chat_id = update.effective_chat.id
     user_id = user.id
     text = update.message.text.strip()
-    message = update.message
 
-    record = get_user_record(user)
+    record = get_user_record(user)  # يتأكد أنه مسجّل ويحدّث آخر نشاط
 
-    # 0️⃣ لو الأدمن يرد بالـ Reply على رسالة دعم
-    if is_admin(user_id) and message.reply_to_message:
-        original_msg_id = message.reply_to_message.message_id
-        target_user_id = ADMIN_INBOX.get(original_msg_id)
+    # 0️⃣ أولًا: لو الأدمن ردّ بـ Reply على رسالة دعم
+    if is_admin(user_id) and update.message.reply_to_message:
+        original_msg_id = update.message.reply_to_message.message_id
+        target_user_id = ADMIN_REPLY_MAP.get(original_msg_id)
         if target_user_id:
             try:
                 context.bot.send_message(
                     chat_id=target_user_id,
-                    text=f"💬 رد من الدعم:\n\n{text}",
+                    text=f"📬 رد من الدعم:\n\n{text}",
                 )
-                message.reply_text("✅ تم إرسال ردّك للمستخدم.", reply_markup=MAIN_KEYBOARD)
+                update.message.reply_text(
+                    "✅ تم إرسال ردك للمستخدم.", reply_markup=MAIN_KEYBOARD
+                )
             except Exception as e:
-                logger.error(f"Error sending admin reply to {target_user_id}: {e}")
-                message.reply_text("حدث خطأ أثناء إرسال الرد للمستخدم.", reply_markup=MAIN_KEYBOARD)
+                logger.error(f"Error sending admin reply to user {target_user_id}: {e}")
+                update.message.reply_text(
+                    "حدث خطأ أثناء إرسال الرد للمستخدم.", reply_markup=MAIN_KEYBOARD
+                )
             return
 
-    # 1️⃣ وضع تواصل مع الدعم
+    # 1️⃣ أولوية: وضع "تواصل مع الدعم"
     if user_id in WAITING_FOR_SUPPORT:
         WAITING_FOR_SUPPORT.remove(user_id)
 
@@ -583,23 +601,24 @@ def handle_text_message(update: Update, context: CallbackContext):
                 sent = context.bot.send_message(
                     chat_id=ADMIN_ID, text=support_msg, parse_mode="Markdown"
                 )
-                ADMIN_INBOX[sent.message_id] = user_id
+                # نربط رسالة الأدمن بالمستخدم الأصلي للرد لاحقًا
+                ADMIN_REPLY_MAP[sent.message_id] = user_id
             except Exception as e:
                 logger.error(f"Error sending support message to admin: {e}")
 
-        message.reply_text(
+        update.message.reply_text(
             "✅ تم إرسال رسالتك للدعم.\n"
             "سيتم التواصل معك إن لزم الأمر 🤍",
             reply_markup=MAIN_KEYBOARD,
         )
         return
 
-    # 2️⃣ وضع رسالة جماعية (للأدمن)
+    # 2️⃣ أولوية: وضع "رسالة جماعية" (للأدمن فقط)
     if user_id in WAITING_FOR_BROADCAST:
         WAITING_FOR_BROADCAST.remove(user_id)
 
         if not is_admin(user_id):
-            message.reply_text(
+            update.message.reply_text(
                 "هذه الميزة خاصة بالمشرف فقط 👨‍💻", reply_markup=MAIN_KEYBOARD
             )
             return
@@ -615,67 +634,66 @@ def handle_text_message(update: Update, context: CallbackContext):
             except Exception as e:
                 logger.error(f"Error sending broadcast to {uid}: {e}")
 
-        message.reply_text(
+        update.message.reply_text(
             f"✅ تم إرسال الرسالة إلى {sent} مستخدم.",
             reply_markup=MAIN_KEYBOARD,
         )
         return
 
-    # 3️⃣ وضع تعيين بداية التعافي
-    if user_id in WAITING_FOR_SET_START:
-        WAITING_FOR_SET_START.remove(user_id)
+    # 3️⃣ أولوية: وضع "تعيين بداية التعافي"
+    if user_id in WAITING_FOR_CUSTOM_START:
+        # نحاول نقرأ عدد الأيام
         try:
-            days_clean = int(text)
-            if days_clean < 0:
-                raise ValueError
-        except ValueError:
-            message.reply_text(
-                "من فضلك أرسل رقمًا صحيحًا يمثل عدد الأيام (مثل: 7).",
+            # نستخرج أول رقم في النص
+            days_str = "".join(ch for ch in text if ch.isdigit())
+            days = int(days_str)
+            now = datetime.now(timezone.utc)
+            start_dt = now - timedelta(days=days)
+            update_user_record(user_id, streak_start=start_dt.isoformat())
+            WAITING_FOR_CUSTOM_START.remove(user_id)
+
+            update.message.reply_text(
+                f"⏰ تم تعيين بداية التعافي قبل {days} يوم.\n"
+                "من الآن عدّادك يحسب من هذا التاريخ 💪",
                 reply_markup=MAIN_KEYBOARD,
             )
-            return
-
-        now = datetime.now(timezone.utc)
-        start_dt = now - timedelta(days=days_clean)
-        update_user_record(user_id, streak_start=start_dt.isoformat())
-
-        delta = get_streak_delta(get_user_record(user))
-        human = format_streak_text(delta)
-
-        message.reply_text(
-            f"⏰ تم تعيين بداية التعافي منذ {days_clean} يوم.\n"
-            f"⏱ مدة ثباتك الآن:\n{human}",
-            reply_markup=MAIN_KEYBOARD,
-        )
-        return
-
-    # 4️⃣ وضع تقييم اليوم
-    if user_id in WAITING_FOR_RATING:
-        WAITING_FOR_RATING.remove(user_id)
-        try:
-            score = int(text)
-            if not 1 <= score <= 10:
-                raise ValueError
-        except ValueError:
-            message.reply_text(
-                "أرسل رقمًا من 1 إلى 10 فقط لتقييم يومك ⭐️.",
+        except Exception:
+            update.message.reply_text(
+                "لم أفهم الرقم 😅\n"
+                "أرسل فقط عدد الأيام مثل: 7 أو 30.",
                 reply_markup=MAIN_KEYBOARD,
             )
-            return
-
-        today = datetime.now(timezone.utc).date().isoformat()
-        ratings = record.get("ratings", [])
-        ratings.append({"date": today, "score": score})
-        update_user_record(user_id, ratings=ratings)
-
-        message.reply_text(
-            f"✅ تم حفظ تقييمك لليوم ({score}/10).\n"
-            "غدًا نحاول نكون أفضل ولو 1٪ 🙌",
-            reply_markup=MAIN_KEYBOARD,
-        )
         return
 
-    # 5️⃣ الأزرار
+    # 4️⃣ تقييم اليوم (لو كان ينتظر تقييم)
+    if record.get("waiting_for_rating"):
+        try:
+            rating = int(text)
+            if rating < 1 or rating > 5:
+                raise ValueError("out of range")
+            ratings = record.get("ratings", [])
+            ratings.append({"value": rating, "at": datetime.now(timezone.utc).isoformat()})
+            record["ratings"] = ratings
+            record["waiting_for_rating"] = False
+            save_data(data)
+
+            msg = "شكراً لتقييمك 🤍\n"
+            if rating <= 2:
+                msg += "يوم صعب، لكن مجرد تقييمك له خطوة وعي قوية، بكرة يكون أفضل بإذن الله 🌤."
+            elif rating == 3:
+                msg += "يوم متوسط، حاول تضيف له حاجة حلوة قبل ما يخلص ✨."
+            else:
+                msg += "يوم ممتاز! ثبت هذا الشعور في ملاحظاتك حتى ترجع له وقت ما تضعف 💎."
+
+            update.message.reply_text(msg, reply_markup=MAIN_KEYBOARD)
+        except Exception:
+            update.message.reply_text(
+                "رجاءً أرسل رقم من 1 إلى 5 فقط لتقييم يومك ⭐.",
+                reply_markup=MAIN_KEYBOARD,
+            )
+        return
+
+    # 5️⃣ التعامل مع الأزرار
     if text == BTN_START:
         handle_start_journey(update, context)
     elif text == BTN_COUNTER:
@@ -692,33 +710,53 @@ def handle_text_message(update: Update, context: CallbackContext):
         handle_notes(update, context)
     elif text == BTN_RESET:
         handle_reset_counter(update, context)
-    elif text == BTN_RATING:
-        handle_rating_button(update, context)
+    elif text == BTN_RATE_DAY:
+        handle_rate_day(update, context)
     elif text == BTN_LEVEL:
         handle_level(update, context)
     elif text == BTN_ACCOUNT:
         handle_account_info(update, context)
     elif text == BTN_SUPPORT:
         handle_contact_support(update, context)
-    elif text == BTN_SET_START:
-        handle_set_start_button(update, context)
+    elif text == BTN_SET_RECOVERY_START:
+        handle_set_recovery_start_button(update, context)
     elif text == BTN_HELP:
-        handle_help_button(update, context)
+        help_command(update, context)
     elif text == BTN_BROADCAST:
         handle_broadcast_button(update, context)
     elif text == BTN_STATS:
         handle_stats_button(update, context)
     else:
-        # 6️⃣ أي نص آخر → نعتبره ملاحظة شخصية
+        # أي نص آخر → نعتبره ملاحظة شخصية
         notes = record.get("notes", [])
         notes.append(text)
         update_user_record(user_id, notes=notes)
 
-        message.reply_text(
+        update.message.reply_text(
             "📝 تم حفظ ملاحظتك.\n"
             "استخدم زر «ملاحظاتي 📓» لعرض آخر ما كتبت.",
             reply_markup=MAIN_KEYBOARD,
         )
+
+# =================== تذكير يومي ===================
+
+
+def send_daily_reminders(context: CallbackContext):
+    logger.info("Running daily reminders job...")
+    user_ids = get_all_user_ids()
+    for uid in user_ids:
+        try:
+            context.bot.send_message(
+                chat_id=uid,
+                text=(
+                    "🤍 تذكير لطيف:\n"
+                    "أنت لست وحدك في هذه الرحلة.\n"
+                    "خذ دقيقة تتنفس بعمق، وتذكر ليش قررت تتعافى، "
+                    "واضغط على الزر اللي تحسه أنسب لك الآن ✨."
+                ),
+            )
+        except Exception as e:
+            logger.error(f"Error sending daily reminder to {uid}: {e}")
 
 # =================== تشغيل البوت ===================
 
@@ -729,21 +767,21 @@ def main():
 
     updater = Updater(BOT_TOKEN, use_context=True)
     dp = updater.dispatcher
+    job_queue = updater.job_queue
 
     # أوامر
     dp.add_handler(CommandHandler("start", start_command))
     dp.add_handler(CommandHandler("help", help_command))
 
-    # جميع الرسائل النصية
+    # جميع الرسائل النصية (بعد الأوامر)
     dp.add_handler(
         MessageHandler(Filters.text & ~Filters.command, handle_text_message)
     )
 
-    # تذكير يومي عبر JobQueue (الساعة 20:00 بتوقيت السيرفر)
-    job_queue = updater.job_queue
+    # جدولة التذكير اليومي (20:00 بتوقيت UTC)
     job_queue.run_daily(
         send_daily_reminders,
-        time=time(hour=20, minute=0),
+        time=time(hour=20, minute=0, tzinfo=pytz.UTC),
         name="daily_reminders",
     )
 
