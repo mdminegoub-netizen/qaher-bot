@@ -447,7 +447,7 @@ def send_support_message(update: Update, context: CallbackContext):
         )
         update.message.reply_text(
             "✅ تم إرسال رسالتك للدعم.\n"
-            "سيتم التواصل معك إن لزم الأمر.",
+            "",
             reply_markup=MAIN_KEYBOARD,
         )
     except Exception as e:
