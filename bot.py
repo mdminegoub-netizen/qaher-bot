@@ -393,7 +393,7 @@ def handle_notes(update: Update, context: CallbackContext):
             f"📓 آخر ملاحظاتك (الأحدث رقم 1):\n\n{joined}\n\n"
             "🗑 لحذف ملاحظة اكتب: مثال «حذف 1».\n"
             "✏️ لتعديل ملاحظة اكتب: مثال «تعديل 1» ثم أرسل النص الجديد.\n"
-            "📝 ويمكنك دائمًا إرسال ملاحظة جديدة في أي وقت.",
+            "❌ في أي وقت تقدر تكتب أو تضغط «إلغاء ❌» للخروج من وضع التعديل.",
             reply_markup=MAIN_KEYBOARD,
         )
 
@@ -427,9 +427,10 @@ def handle_rate_day(update: Update, context: CallbackContext):
     update.message.reply_text(
         "⭐️ قيّم يومك من 1 إلى 5 بكتابة *الرقم فقط* الآن.\n"
         "1 يعني يوم سيّئ جدًا، و5 يعني يوم ممتاز.\n"
-        "لن يتم حفظ الرقم كملاحظة، هذا التقييم بس عشانك أنت ✨",
+        "لن يتم حفظ الرقم كملاحظة، هذا التقييم بس عشانك أنت ✨\n\n"
+        "لو حبيت الإلغاء اضغط «إلغاء ❌».",
         parse_mode="Markdown",
-        reply_markup=ReplyKeyboardRemove(),
+        reply_markup=SMALL_CANCEL_KEYBOARD,   # <-- زر إلغاء هنا
     )
 
 
@@ -440,7 +441,7 @@ def handle_level(update: Update, context: CallbackContext):
 
     if not delta:
         update.message.reply_text(
-            "مستواك الحالي: *مستكشف مبتدئ* 🌱\n"
+            "مستواك الحالي: *مستكشف مبتدئ 🌱*\n"
             "ابدأ الرحلة أولاً عبر زر «بدء الرحلة 🚀».",
             parse_mode="Markdown",
             reply_markup=MAIN_KEYBOARD,
@@ -554,9 +555,10 @@ def handle_set_date_button(update: Update, context: CallbackContext):
         "`2025-11-20 15:30`\n"
         "2️⃣ أو تكتب فقط *عدد الأيام* التي مضت منذ بداية تعافيك، مثلاً:\n"
         "`7`\n\n"
-        "اكتب الآن ما يناسبك 🤍",
+        "اكتب الآن ما يناسبك 🤍\n"
+        "ولو حبيت الإلغاء اضغط «إلغاء ❌».",
         parse_mode="Markdown",
-        reply_markup=ReplyKeyboardRemove(),
+        reply_markup=SMALL_CANCEL_KEYBOARD,   # <-- زر إلغاء هنا
     )
 
 # =================== هاندلر الرسائل العامة ===================
@@ -564,7 +566,8 @@ def handle_set_date_button(update: Update, context: CallbackContext):
 
 def extract_user_id_from_text(text: str):
     """استخراج الـ ID من رسالة الدعم التي يستقبلها الأدمن."""
-    match = re.search(r"ID:\s*`(\d+)`", text)
+    # دعم وجود أو عدم وجود الـ backticks في النص
+    match = re.search(r"ID:\s*`?(\d+)`?", text)
     if match:
         return int(match.group(1))
     return None
@@ -859,8 +862,9 @@ def handle_text_message(update: Update, context: CallbackContext):
 
         NOTE_EDIT_INDEX[user_id] = note_idx
         update.message.reply_text(
-            f"✏️ اكتب الآن النص الجديد للملاحظة رقم {note_idx}.",
-            reply_markup=ReplyKeyboardRemove(),
+            f"✏️ اكتب الآن النص الجديد للملاحظة رقم {note_idx}.\n"
+            "ولو حبيت الإلغاء اضغط «إلغاء ❌».",
+            reply_markup=SMALL_CANCEL_KEYBOARD,   # <-- زر إلغاء أثناء التعديل
         )
         return
 
