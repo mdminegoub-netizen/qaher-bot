@@ -28,13 +28,14 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATA_FILE = "user_data.json"
 
 # ضع هنا ID الأدمن (بدون علامات تنصيص)
-# مثال: ADMIN_ID = 931350292
 ADMIN_ID = 931350292  # عدّل هذا للـ ID تبعك
 
 # حالات خاصة للمستخدمين
 WAITING_FOR_SUPPORT = set()      # مستخدم يكتب رسالة للدعم
 WAITING_FOR_BROADCAST = set()    # الأدمن يكتب رسالة جماعية
 WAITING_FOR_DATE = set()         # مستخدم يضبط بداية التعافي يدوياً
+WAITING_FOR_RATING = set()       # مستخدم يقيّم اليوم
+NOTE_EDIT_INDEX = {}             # user_id -> رقم الملاحظة المطلوب تعديلها
 
 # ملف اللوج
 logging.basicConfig(
@@ -381,10 +382,18 @@ def handle_notes(update: Update, context: CallbackContext):
             reply_markup=MAIN_KEYBOARD,
         )
     else:
-        joined = "\n\n".join(f"• {n}" for n in notes[-20:])
+        # نعرض آخر 20 ملاحظة، الأحدث أولاً مع ترقيم
+        last_notes = notes[-20:]
+        indexed = []
+        for i, n in enumerate(reversed(last_notes), start=1):
+            indexed.append(f"{i}. {n}")
+        joined = "\n\n".join(indexed)
+
         update.message.reply_text(
-            f"📓 آخر ملاحظاتك:\n\n{joined}\n\n"
-            "اكتب ملاحظة جديدة متى ما احتجت تفضفض أو ترتّب أفكارك 📝",
+            f"📓 آخر ملاحظاتك (الأحدث رقم 1):\n\n{joined}\n\n"
+            "🗑 لحذف ملاحظة اكتب: مثال «حذف 1».\n"
+            "✏️ لتعديل ملاحظة اكتب: مثال «تعديل 1» ثم أرسل النص الجديد.\n"
+            "📝 ويمكنك دائمًا إرسال ملاحظة جديدة في أي وقت.",
             reply_markup=MAIN_KEYBOARD,
         )
 
@@ -412,10 +421,15 @@ def handle_reset_counter(update: Update, context: CallbackContext):
 
 
 def handle_rate_day(update: Update, context: CallbackContext):
+    user_id = update.effective_user.id
+    WAITING_FOR_RATING.add(user_id)
+
     update.message.reply_text(
-        "⭐️ قيّم يومك من 1 إلى 5 في رأسك الآن.\n"
-        "لو كان أقل من 3، اختر زر «خطة الطوارئ 🆘» أو «نصيحة 💡» وخذ خطوة صغيرة تحسّن بها غدك ✨",
-        reply_markup=MAIN_KEYBOARD,
+        "⭐️ قيّم يومك من 1 إلى 5 بكتابة *الرقم فقط* الآن.\n"
+        "1 يعني يوم سيّئ جدًا، و5 يعني يوم ممتاز.\n"
+        "لن يتم حفظ الرقم كملاحظة، هذا التقييم بس عشانك أنت ✨",
+        parse_mode="Markdown",
+        reply_markup=ReplyKeyboardRemove(),
     )
 
 
@@ -588,6 +602,20 @@ def handle_text_message(update: Update, context: CallbackContext):
                 reply_markup=MAIN_KEYBOARD,
             )
             return
+        if user_id in WAITING_FOR_RATING:
+            WAITING_FOR_RATING.discard(user_id)
+            update.message.reply_text(
+                "تم إلغاء تقييم اليوم ✅",
+                reply_markup=MAIN_KEYBOARD,
+            )
+            return
+        if user_id in NOTE_EDIT_INDEX:
+            NOTE_EDIT_INDEX.pop(user_id, None)
+            update.message.reply_text(
+                "تم إلغاء تعديل الملاحظة ✅",
+                reply_markup=MAIN_KEYBOARD,
+            )
+            return
 
     # ===== رد الأدمن على رسالة دعم (Reply) =====
     if is_admin(user_id) and update.message.reply_to_message:
@@ -611,6 +639,45 @@ def handle_text_message(update: Update, context: CallbackContext):
                     reply_markup=MAIN_KEYBOARD,
                 )
             return
+
+    # ===== معالجة تقييم اليوم =====
+    if user_id in WAITING_FOR_RATING:
+        WAITING_FOR_RATING.discard(user_id)
+        try:
+            value = int(text)
+            if value < 1 or value > 5:
+                update.message.reply_text(
+                    "⚠️ قيّم من 1 إلى 5 فقط.\n"
+                    "لو حاب تعيد التقييم اضغط «تقييم اليوم ⭐️».",
+                    reply_markup=MAIN_KEYBOARD,
+                )
+                return
+
+            if value >= 4:
+                msg = (
+                    f"👏 تقييمك: {value}/5\n"
+                    "رائع! حاول تلاحظ الأشياء اللي خلت يومك جميل وكرّرها بكرة 💎"
+                )
+            elif value == 3:
+                msg = (
+                    f"🙂 تقييمك: {value}/5\n"
+                    "يوم عادي، حلو إنك صامد. جرّب بكرة تضيف عادة صغيرة إيجابية ✨"
+                )
+            else:
+                msg = (
+                    f"💔 تقييمك: {value}/5\n"
+                    "مو مشكلة، كلنا نمر بأيام صعبة.\n"
+                    "جرّب تضغط «خطة الطوارئ 🆘» أو «نصيحة 💡» وتاخذ خطوة صغيرة تحسّن بها غدك 🤍"
+                )
+
+            update.message.reply_text(msg, reply_markup=MAIN_KEYBOARD)
+        except ValueError:
+            update.message.reply_text(
+                "⚠️ اكتب رقم من 1 إلى 5 فقط.\n"
+                "لو حاب تعيد التقييم اضغط «تقييم اليوم ⭐️».",
+                reply_markup=MAIN_KEYBOARD,
+            )
+        return
 
     # ===== تعيين بداية التعافي يدوياً =====
     if user_id in WAITING_FOR_DATE:
@@ -710,6 +777,90 @@ def handle_text_message(update: Update, context: CallbackContext):
         update.message.reply_text(
             f"✅ تم إرسال الرسالة إلى {sent} مستخدم.",
             reply_markup=MAIN_KEYBOARD,
+        )
+        return
+
+    # ===== إنهاء تعديل الملاحظة (بعد أمر تعديل X) =====
+    if user_id in NOTE_EDIT_INDEX:
+        idx_from_latest = NOTE_EDIT_INDEX.pop(user_id)
+        notes = record.get("notes", [])
+        if not notes:
+            update.message.reply_text(
+                "📓 لا توجد ملاحظات لتعديلها.",
+                reply_markup=MAIN_KEYBOARD,
+            )
+            return
+
+        real_index = len(notes) - idx_from_latest  # الأحدث = -1
+        if real_index < 0 or real_index >= len(notes):
+            update.message.reply_text(
+                "⚠️ رقم الملاحظة غير صحيح.",
+                reply_markup=MAIN_KEYBOARD,
+            )
+            return
+
+        notes[real_index] = text
+        update_user_record(user_id, notes=notes)
+
+        update.message.reply_text(
+            f"✏️ تم تعديل الملاحظة رقم {idx_from_latest} بنجاح ✅",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return
+
+    # ===== أوامر حذف/تعديل الملاحظات =====
+    m_del = re.match(r"^حذف\s+(\d+)$", text)
+    if m_del:
+        note_idx = int(m_del.group(1))
+        notes = record.get("notes", [])
+        if not notes:
+            update.message.reply_text(
+                "📓 لا توجد ملاحظات لحذفها.",
+                reply_markup=MAIN_KEYBOARD,
+            )
+            return
+
+        if note_idx < 1 or note_idx > len(notes):
+            update.message.reply_text(
+                "⚠️ رقم الملاحظة غير صحيح.\n"
+                "تذكّر أن أحدث ملاحظة رقمها 1.",
+                reply_markup=MAIN_KEYBOARD,
+            )
+            return
+
+        real_index = len(notes) - note_idx
+        deleted = notes.pop(real_index)
+        update_user_record(user_id, notes=notes)
+
+        update.message.reply_text(
+            f"🗑 تم حذف الملاحظة رقم {note_idx}:\n«{deleted}»",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return
+
+    m_edit = re.match(r"^تعديل\s+(\d+)$", text)
+    if m_edit:
+        note_idx = int(m_edit.group(1))
+        notes = record.get("notes", [])
+        if not notes:
+            update.message.reply_text(
+                "📓 لا توجد ملاحظات لتعديلها.",
+                reply_markup=MAIN_KEYBOARD,
+            )
+            return
+
+        if note_idx < 1 or note_idx > len(notes):
+            update.message.reply_text(
+                "⚠️ رقم الملاحظة غير صحيح.\n"
+                "تذكّر أن أحدث ملاحظة رقمها 1.",
+                reply_markup=MAIN_KEYBOARD,
+            )
+            return
+
+        NOTE_EDIT_INDEX[user_id] = note_idx
+        update.message.reply_text(
+            f"✏️ اكتب الآن النص الجديد للملاحظة رقم {note_idx}.",
+            reply_markup=ReplyKeyboardRemove(),
         )
         return
 
