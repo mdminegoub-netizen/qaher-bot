@@ -28,7 +28,7 @@ DATA_FILE = "user_data.json"
 
 # ضع هنا ID الأدمن (بدون علامات تنصيص)
 # مثال: ADMIN_ID = 931350292
-ADMIN_ID = 931350292  # عدّل هذا للـ ID تبعك
+ADMIN_ID = 931350292  # عدّل هذا للـ ID تبعك لو حاب
 
 # حالات خاصة بالمستخدمين
 WAITING_FOR_SUPPORT = set()          # يكتب رسالة دعم
@@ -125,9 +125,28 @@ def get_all_user_ids():
 
 
 def is_admin(user_id: int) -> bool:
-    if ADMIN_ID is None:
-        return False
-    return user_id == ADMIN_ID
+    """
+    يحدد هل المستخدم أدمن أم لا:
+    1) لو ADMIN_ID مضبوط ويطابق user_id → أدمن.
+    2) لو ما فيه ADMIN_ID صحيح → أول مستخدم دخل البوت يُعتبر الأدمن.
+    """
+    try:
+        if ADMIN_ID is not None and user_id == ADMIN_ID:
+            return True
+
+        # fallback: أول مستخدم في الداتا
+        if data:
+            owner = sorted(
+                data.values(),
+                key=lambda r: r.get("created_at", "")
+            )[0]
+            owner_id = owner.get("user_id")
+            if owner_id and user_id == owner_id:
+                return True
+    except Exception as e:
+        logger.error(f"Error checking admin: {e}")
+
+    return False
 
 # =================== حساب مدة الثبات ===================
 
@@ -311,7 +330,7 @@ def handle_days_counter(update: Update, context: CallbackContext):
 
 def handle_tip(update: Update, context: CallbackContext):
     tip = random.choice(TIPS)
-    update.message.reply_text(tip, reply_markup=MAIN_KEYBOARD, parse_mode=None)
+    update.message.reply_text(tip, reply_markup=MAIN_KEYBOARD)
 
 
 def handle_emergency(update: Update, context: CallbackContext):
@@ -532,7 +551,7 @@ def handle_text_message(update: Update, context: CallbackContext):
     record = get_user_record(user)
 
     # 0️⃣ لو الأدمن يرد بالـ Reply على رسالة دعم
-    if is_admin(chat_id) and message.reply_to_message:
+    if is_admin(user_id) and message.reply_to_message:
         original_msg_id = message.reply_to_message.message_id
         target_user_id = ADMIN_INBOX.get(original_msg_id)
         if target_user_id:
@@ -564,7 +583,6 @@ def handle_text_message(update: Update, context: CallbackContext):
                 sent = context.bot.send_message(
                     chat_id=ADMIN_ID, text=support_msg, parse_mode="Markdown"
                 )
-                # ربط رسالة الأدمن بالمستخدم للرد لاحقًا
                 ADMIN_INBOX[sent.message_id] = user_id
             except Exception as e:
                 logger.error(f"Error sending support message to admin: {e}")
@@ -721,11 +739,11 @@ def main():
         MessageHandler(Filters.text & ~Filters.command, handle_text_message)
     )
 
-    # تذكير يومي عبر JobQueue (الساعة 20:00 بتوقيت السيرفر - غالبًا UTC)
+    # تذكير يومي عبر JobQueue (الساعة 20:00 بتوقيت السيرفر)
     job_queue = updater.job_queue
     job_queue.run_daily(
         send_daily_reminders,
-        time=time(hour=20, minute=0),  # بدون timezone لتفادي مشكلة APScheduler
+        time=time(hour=20, minute=0),
         name="daily_reminders",
     )
 
