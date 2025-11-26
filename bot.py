@@ -2,11 +2,10 @@ import os
 import json
 import logging
 import random
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, time
 from threading import Thread
 
 from flask import Flask
-from apscheduler.schedulers.background import BackgroundScheduler
 
 from telegram import (
     Update,
@@ -76,7 +75,6 @@ def save_data(data):
         with open(DATA_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        # ✅ هنا كان الخطأ – أضفنا علامة التنصيص الناقصة
         logger.error(f"Error saving data: {e}")
 
 
@@ -85,8 +83,9 @@ data = load_data()
 
 def get_user_record(user: "telegram.User"):
     user_id = str(user.id)
+    now = datetime.now(timezone.utc).isoformat()
+
     if user_id not in data:
-        now = datetime.now(timezone.utc).isoformat()
         data[user_id] = {
             "user_id": user.id,
             "first_name": user.first_name,
@@ -100,10 +99,11 @@ def get_user_record(user: "telegram.User"):
     else:
         # تحديث آخر نشاط + اسم المستخدم لو تغيّر
         record = data[user_id]
-        record["last_active"] = datetime.now(timezone.utc).isoformat()
+        record["last_active"] = now
         record["first_name"] = user.first_name
         record["username"] = user.username
         save_data(data)
+
     return data[user_id]
 
 
@@ -111,8 +111,9 @@ def update_user_record(user_id: int, **kwargs):
     uid = str(user_id)
     if uid not in data:
         return
-    data[uid].update(kwargs)
-    data[uid]["last_active"] = datetime.now(timezone.utc).isoformat()
+    record = data[uid]
+    record.update(kwargs)
+    record["last_active"] = datetime.now(timezone.utc).isoformat()
     save_data(data)
 
 
@@ -144,26 +145,24 @@ def get_streak_delta(record) -> timedelta | None:
 
 
 def format_streak_text(delta: timedelta) -> str:
+    """
+    يعرض دائماً: شهر، يوم، ساعة، دقيقة (حتى لو 0)
+    """
     total_minutes = int(delta.total_seconds() // 60)
     total_hours = int(delta.total_seconds() // 3600)
     total_days = int(delta.total_seconds() // 86400)
-    # تقريب الأشهر على أساس 30 يوماً
+
     months = total_days // 30
     days = total_days % 30
     hours = total_hours % 24
     minutes = total_minutes % 60
 
-    parts = []
-    if months:
-        parts.append(f"{months} شهر")
-    if days:
-        parts.append(f"{days} يوم")
-    if hours:
-        parts.append(f"{hours} ساعة")
-    if minutes or not parts:
-        parts.append(f"{minutes} دقيقة")
-
-    return "، ".join(parts)
+    return (
+        f"{months} شهر، "
+        f"{days} يوم، "
+        f"{hours} ساعة، "
+        f"{minutes} دقيقة"
+    )
 
 # =================== الأزرار الرئيسية ===================
 
@@ -176,8 +175,10 @@ BTN_DHIKR = "أذكار وسكينة 🕊"
 BTN_NOTES = "ملاحظاتي 📓"
 BTN_RESET = "إعادة ضبط العداد ♻️"
 BTN_SUPPORT = "تواصل مع الدعم ✉️"
+BTN_ACCOUNT = "معرفة حسابي 👤"
 BTN_BROADCAST = "رسالة جماعية 📢"
 BTN_STATS = "عدد المستخدمين 👥"
+BTN_HELP = "مساعدة ℹ️"
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
@@ -185,8 +186,9 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
         [KeyboardButton(BTN_TIP), KeyboardButton(BTN_EMERGENCY)],
         [KeyboardButton(BTN_RELAPSE), KeyboardButton(BTN_DHIKR)],
         [KeyboardButton(BTN_NOTES), KeyboardButton(BTN_RESET)],
-        [KeyboardButton(BTN_SUPPORT)],
+        [KeyboardButton(BTN_ACCOUNT), KeyboardButton(BTN_SUPPORT)],
         [KeyboardButton(BTN_BROADCAST), KeyboardButton(BTN_STATS)],
+        [KeyboardButton(BTN_HELP)],
     ],
     resize_keyboard=True,
 )
@@ -213,7 +215,7 @@ RELAPSE_REASONS = (
     "🧠 *أسباب الانتكاس الشائعة:*\n"
     "• الفراغ وعدم وجود أهداف واضحة.\n"
     "• استخدام الهاتف في السرير ووقت متأخر.\n"
-    "• متابعة محتوى مُثير ولو كان \"بريئًا\" ظاهريًا.\n"
+    "• متابعة محتوى مُثير ولو كان «بريئًا» ظاهريًا.\n"
     "• العزلة والابتعاد عن الناس لفترات طويلة.\n"
     "حاول تلاحظ السبب الأقرب لك وتعالجه مباشرة."
 )
@@ -244,9 +246,13 @@ def start_command(update: Update, context: CallbackContext):
 
 def help_command(update: Update, context: CallbackContext):
     update.message.reply_text(
-        "استخدم الأزرار بالأسفل للتحكم في البوت.\n"
+        "📌 *طريقة استخدام البوت:*\n"
+        "• اضغط «بدء الرحلة 🚀» لبدء عداد الثبات.\n"
+        "• «عداد الأيام 🗓» لمعرفة مدة ثباتك.\n"
+        "• باقي الأزرار لكل ما تحتاجه أثناء الرحلة.\n\n"
         "لو احتجت مساعدة إضافية اضغط على زر «تواصل مع الدعم ✉️».",
         reply_markup=MAIN_KEYBOARD,
+        parse_mode="Markdown",
     )
 
 # =================== وظائف الأزرار ===================
@@ -262,7 +268,8 @@ def handle_start_journey(update: Update, context: CallbackContext):
         if delta:
             human = format_streak_text(delta)
             update.message.reply_text(
-                f"🚀 رحلتك بدأت من قبل.\nمدة ثباتك الحالية: {human}."
+                f"🚀 رحلتك بدأت من قبل.\nمدة ثباتك الحالية:\n{human}",
+                reply_markup=MAIN_KEYBOARD,
             )
             return
 
@@ -371,6 +378,39 @@ def handle_contact_support(update: Update, context: CallbackContext):
         "✉️ اكتب الآن رسالتك التي تريد إرسالها للدعم.\n"
         "سيتم إرسالها للأدمن مع معلومات حسابك.",
         reply_markup=MAIN_KEYBOARD,
+    )
+
+
+def handle_account_info(update: Update, context: CallbackContext):
+    user = update.effective_user
+    record = get_user_record(user)
+
+    delta = get_streak_delta(record)
+    if delta:
+        streak_text = format_streak_text(delta)
+    else:
+        streak_text = "لم تبدأ رحلتك بعد."
+
+    created_at = record.get("created_at")
+    created_text = created_at
+    try:
+        if created_at:
+            dt = datetime.fromisoformat(created_at)
+            created_text = dt.strftime("%Y-%m-%d %H:%M UTC")
+    except Exception:
+        pass
+
+    text = (
+        "👤 *معلومات حسابك في البوت:*\n\n"
+        f"• الاسم: {user.full_name}\n"
+        f"• ID: `{user.id}`\n"
+        f"• اسم المستخدم: @{user.username if user.username else 'لا يوجد'}\n"
+        f"• تاريخ الانضمام: {created_text}\n"
+        f"• حالة الرحلة: {streak_text}"
+    )
+
+    update.message.reply_text(
+        text, reply_markup=MAIN_KEYBOARD, parse_mode="Markdown"
     )
 
 
@@ -487,10 +527,14 @@ def handle_text_message(update: Update, context: CallbackContext):
         handle_reset_counter(update, context)
     elif text == BTN_SUPPORT:
         handle_contact_support(update, context)
+    elif text == BTN_ACCOUNT:
+        handle_account_info(update, context)
     elif text == BTN_BROADCAST:
         handle_broadcast_button(update, context)
     elif text == BTN_STATS:
         handle_stats_button(update, context)
+    elif text == BTN_HELP:
+        help_command(update, context)
     else:
         # أي نص آخر → نعتبره ملاحظة شخصية
         notes = record.get("notes", [])
@@ -506,12 +550,12 @@ def handle_text_message(update: Update, context: CallbackContext):
 # =================== تذكير يومي ===================
 
 
-def send_daily_reminders(bot):
+def send_daily_reminders(context: CallbackContext):
     logger.info("Running daily reminders job...")
     user_ids = get_all_user_ids()
     for uid in user_ids:
         try:
-            bot.send_message(
+            context.bot.send_message(
                 chat_id=uid,
                 text=(
                     "🤍 تذكير لطيف:\n"
@@ -541,18 +585,13 @@ def main():
         MessageHandler(Filters.text & ~Filters.command, handle_text_message)
     )
 
-    # جدولة التذكير اليومي (مثال: 20:00 بتوقيت UTC)
-    scheduler = BackgroundScheduler(timezone=timezone.utc)
-    scheduler.add_job(
+    # جدولة التذكير اليومي عن طريق JobQueue (بدون APScheduler)
+    job_queue = updater.job_queue
+    job_queue.run_daily(
         send_daily_reminders,
-        "cron",
-        hour=20,
-        minute=0,
-        id="daily_reminders",
-        replace_existing=True,
-        args=[updater.bot],  # نمرر كائن البوت للوظيفة
+        time=time(hour=20, minute=0, tzinfo=timezone.utc),
+        name="daily_reminders",
     )
-    scheduler.start()
 
     # تشغيل Flask في ثريد منفصل
     Thread(target=run_flask, daemon=True).start()
