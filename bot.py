@@ -76,7 +76,8 @@ def save_data(data):
         with open(DATA_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        logger.error(f"Error saving data: {e})
+        # ✅ هنا كان الخطأ – أضفنا علامة التنصيص الناقصة
+        logger.error(f"Error saving data: {e}")
 
 
 data = load_data()
@@ -230,7 +231,7 @@ ADHKAR = (
 
 def start_command(update: Update, context: CallbackContext):
     user = update.effective_user
-    record = get_user_record(user)
+    get_user_record(user)
 
     text = (
         f"أهلاً {user.first_name} 🌱\n\n"
@@ -239,9 +240,6 @@ def start_command(update: Update, context: CallbackContext):
     )
 
     update.message.reply_text(text, reply_markup=MAIN_KEYBOARD, parse_mode="Markdown")
-
-    # لو ما عنده بداية رحلة نتركها None حتى يضغط بدء الرحلة
-    # (لا نعدّل شيء هنا)
 
 
 def help_command(update: Update, context: CallbackContext):
@@ -457,7 +455,9 @@ def handle_text_message(update: Update, context: CallbackContext):
         sent = 0
         for uid in user_ids:
             try:
-                context.bot.send_message(chat_id=uid, text=f"📢 رسالة من الدعم:\n\n{text}")
+                context.bot.send_message(
+                    chat_id=uid, text=f"📢 رسالة من الدعم:\n\n{text}"
+                )
                 sent += 1
             except Exception as e:
                 logger.error(f"Error sending broadcast to {uid}: {e}")
@@ -506,12 +506,12 @@ def handle_text_message(update: Update, context: CallbackContext):
 # =================== تذكير يومي ===================
 
 
-def send_daily_reminders(context: CallbackContext):
+def send_daily_reminders(bot):
     logger.info("Running daily reminders job...")
     user_ids = get_all_user_ids()
     for uid in user_ids:
         try:
-            context.bot.send_message(
+            bot.send_message(
                 chat_id=uid,
                 text=(
                     "🤍 تذكير لطيف:\n"
@@ -544,12 +544,13 @@ def main():
     # جدولة التذكير اليومي (مثال: 20:00 بتوقيت UTC)
     scheduler = BackgroundScheduler(timezone=timezone.utc)
     scheduler.add_job(
-        lambda: send_daily_reminders(updater.job_queue),
+        send_daily_reminders,
         "cron",
         hour=20,
         minute=0,
         id="daily_reminders",
         replace_existing=True,
+        args=[updater.bot],  # نمرر كائن البوت للوظيفة
     )
     scheduler.start()
 
