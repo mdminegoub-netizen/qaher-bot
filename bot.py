@@ -585,11 +585,11 @@ def main():
         MessageHandler(Filters.text & ~Filters.command, handle_text_message)
     )
 
-    # جدولة التذكير اليومي عن طريق JobQueue (بدون APScheduler)
+    # جدولة التذكير اليومي عن طريق JobQueue (بدون تحديد timezone)
     job_queue = updater.job_queue
     job_queue.run_daily(
         send_daily_reminders,
-        time=time(hour=20, minute=0, tzinfo=timezone.utc),
+        time=time(hour=20, minute=0),
         name="daily_reminders",
     )
 
