@@ -2,12 +2,11 @@ import os
 import json
 import logging
 import random
-import re
 from datetime import datetime, timezone, timedelta, time
 from threading import Thread
 
-import pytz
 from flask import Flask
+from apscheduler.schedulers.background import BackgroundScheduler
 
 from telegram import (
     Update,
@@ -22,29 +21,23 @@ from telegram.ext import (
     CallbackContext,
 )
 
-# =================== إعدادات أساسية ===================
+import pytz
+
+# =================== الإعدادات الأساسية ===================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATA_FILE = "user_data.json"
 
-# ضع هنا ID الأدمن
-ADMIN_ID = 931350292  # عدّل هذا للـ ID تبعك
+# عدّلي هذا إلى ID الخاص بحساب المشرفة (بدون علامات تنصيص)
+ADMIN_ID = 931350292  # مثال
 
-# حالات المستخدمين
+# تتبّع من في وضع "تواصل مع الدعم"
 WAITING_FOR_SUPPORT = set()
+# تتبّع من في وضع "رسالة جماعية"
 WAITING_FOR_BROADCAST = set()
-WAITING_FOR_NOTE = set()              # لإضافة ملاحظة جديدة فقط
-WAITING_FOR_NOTE_MENU = set()         # قائمة إدارة الملاحظات
-WAITING_FOR_NOTE_EDIT = set()         # اختيار رقم ملاحظة للتعديل
-WAITING_FOR_NOTE_EDIT_TEXT = set()    # إرسال نص جديد بعد اختيار الرقم
-WAITING_FOR_NOTE_DELETE = set()       # اختيار رقم ملاحظة للحذف
-WAITING_FOR_RATING = set()
-WAITING_FOR_CUSTOM_START = set()
 
-# خريطة لحفظ رقم الملاحظة المؤقت أثناء التعديل
-NOTE_EDIT_INDEX = {}
+# =================== إعداد اللوج ===================
 
-# ملف اللوج
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
@@ -58,14 +51,14 @@ app = Flask(__name__)
 
 @app.route("/")
 def index():
-    return "Qaher-bot is running ✅"
+    return "Qaher-bot (girls version) is running ✅"
 
 
 def run_flask():
     port = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
 
-# =================== تخزين بيانات المستخدمين ===================
+# =================== تخزين بيانات المستخدمات ===================
 
 
 def load_data():
@@ -90,12 +83,20 @@ def save_data(data):
 data = load_data()
 
 
+def is_admin(user_id: int) -> bool:
+    return ADMIN_ID is not None and user_id == ADMIN_ID
+
+
 def get_user_record(user):
-    """يرجع سجل المستخدم، ويحدّث الاسم / اليوزر / آخر نشاط."""
+    """
+    ترجع سجل المستخدمة، وتنشئ واحدًا جديدًا إن لم يوجد.
+    """
     user_id = str(user.id)
     now_iso = datetime.now(timezone.utc).isoformat()
 
+    created = False
     if user_id not in data:
+        created = True
         data[user_id] = {
             "user_id": user.id,
             "first_name": user.first_name,
@@ -104,16 +105,15 @@ def get_user_record(user):
             "last_active": now_iso,
             "streak_start": None,
             "notes": [],
-            "ratings": [],
         }
     else:
-        record = data[user_id]
-        record["first_name"] = user.first_name
-        record["username"] = user.username
-        record["last_active"] = now_iso
+        # تحديث آخر نشاط والاسم واسم المستخدم
+        data[user_id]["last_active"] = now_iso
+        data[user_id]["first_name"] = user.first_name
+        data[user_id]["username"] = user.username
 
     save_data(data)
-    return data[user_id]
+    return data[user_id], created
 
 
 def update_user_record(user_id: int, **kwargs):
@@ -128,11 +128,7 @@ def update_user_record(user_id: int, **kwargs):
 def get_all_user_ids():
     return [int(uid) for uid in data.keys()]
 
-
-def is_admin(user_id: int) -> bool:
-    return ADMIN_ID is not None and user_id == ADMIN_ID
-
-# =================== حساب مدة الثبات ===================
+# =================== حساب مدة التعافي ===================
 
 
 def get_streak_delta(record):
@@ -154,7 +150,6 @@ def format_streak_text(delta: timedelta) -> str:
     total_minutes = int(delta.total_seconds() // 60)
     total_hours = int(delta.total_seconds() // 3600)
     total_days = int(delta.total_seconds() // 86400)
-    # تقريب الأشهر 30 يوم
     months = total_days // 30
     days = total_days % 30
     hours = total_hours % 24
@@ -172,37 +167,44 @@ def format_streak_text(delta: timedelta) -> str:
 
     return "، ".join(parts)
 
-# =================== الأزرار الرئيسية ===================
+# =================== الأزرار ===================
 
 BTN_START = "بدء الرحلة 🚀"
-BTN_COUNTER = "عداد الأيام 🗓"
-BTN_TIP = "نصيحة 💡"
+BTN_COUNTER = "عداد التعافي ⏱"
+BTN_TIP = "نصيحة للبنات 💖"
 BTN_EMERGENCY = "خطة الطوارئ 🆘"
 BTN_RELAPSE = "أسباب الانتكاس 🧠"
 BTN_DHIKR = "أذكار وسكينة 🕊"
 BTN_NOTES = "ملاحظاتي 📓"
-BTN_RATING = "تقييم اليوم ⭐"
 BTN_RESET = "إعادة ضبط العداد ♻️"
-BTN_SET_START = "تعيين بداية التعافي ⏱"
 BTN_SUPPORT = "تواصل مع الدعم ✉️"
 BTN_BROADCAST = "رسالة جماعية 📢"
-BTN_STATS = "عدد المستخدمين 👥"
+BTN_STATS = "عدد المشتركات 👥"
 BTN_CANCEL = "إلغاء ❌"
-
-# أزرار إدارة الملاحظات
-BTN_NOTE_ADD = "➕ إضافة ملاحظة جديدة"
-BTN_NOTE_EDIT = "✏️ تعديل ملاحظة"
-BTN_NOTE_DELETE = "🗑 حذف ملاحظة"
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
         [KeyboardButton(BTN_START), KeyboardButton(BTN_COUNTER)],
         [KeyboardButton(BTN_TIP), KeyboardButton(BTN_EMERGENCY)],
         [KeyboardButton(BTN_RELAPSE), KeyboardButton(BTN_DHIKR)],
-        [KeyboardButton(BTN_NOTES), KeyboardButton(BTN_RATING)],
-        [KeyboardButton(BTN_RESET), KeyboardButton(BTN_SET_START)],
+        [KeyboardButton(BTN_NOTES), KeyboardButton(BTN_RESET)],
         [KeyboardButton(BTN_SUPPORT)],
         [KeyboardButton(BTN_BROADCAST), KeyboardButton(BTN_STATS)],
+    ],
+    resize_keyboard=True,
+)
+
+SUPPORT_KEYBOARD = ReplyKeyboardMarkup(
+    [
+        [KeyboardButton(BTN_CANCEL)],
+    ],
+    resize_keyboard=True,
+)
+
+
+BROADCAST_KEYBOARD = ReplyKeyboardMarkup(
+    [
+        [KeyboardButton(BTN_CANCEL)],
     ],
     resize_keyboard=True,
 )
@@ -210,74 +212,70 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
 # =================== رسائل جاهزة ===================
 
 TIPS = [
-    "غيّر مكانك فوراً عندما تشعر بالضعف، الحركة تكسر موجة العادة 💥.",
-    "تذكّر أن كل دقيقة ثبات هي انتصار صغير يبني شخصية جديدة 💪.",
-    "اهتم بالنوم الجيد، التعب يُضعف قدرتك على المقاومة 😴.",
-    "اشغل يديك بشيء نافع: كتابة، رسم، قراءة، أو تمرين بسيط ✍️.",
-    "قرّب منك الأشخاص الإيجابيين، الجو النظيف يساعدك على الثبات 🤍.",
+    "حبيبتي، كل محاولة لمقاومة العادات السيئة هي خطوة عملية نحو احترامك لذاتك من جديد، فلا تستهيني بأي لحظة ثبات 💪🩷",
+    "إن شعرتِ بضعف، غيّري مكانك فورًا: انهضي، افتحي النافذة، تحركي قليلًا… تغيير الجو يغيّر الفكرة 🌿",
+    "قاعدة مهمّة لسلامتك: لا استخدام للهاتف وأنتِ على السرير ليلًا، فهذا من أكبر أبواب الانتكاس 🚫📱",
+    "اهتمي بروتين بسيط لنفسك: عناية ببشرتك، كوب شراب دافئ، قراءة، أو كتابة… هذه الأشياء الصغيرة تصنع فارقًا كبيرًا في مزاجك يا جميلتي 🌸",
+    "تخفيف متابعة الحسابات والمحتويات التي تثير الفضول أو المقارنات حماية لقلبك ونفسك قبل أن تكون قيودًا عليكِ 🙏",
 ]
 
 EMERGENCY_PLAN = (
-    "🆘 *خطة الطوارئ عند لحظة الضعف:*\n"
-    "1️⃣ غيّر وضع جسمك فوراً (انهض/اجلس/تحرك).\n"
-    "2️⃣ اخرج من المكان الذي يثيرك ولو لخمس دقائق.\n"
-    "3️⃣ خذ نفسًا عميقًا 10 مرات ببطء.\n"
-    "4️⃣ استمع لسورة تحبها أو ردّد أذكارًا.\n"
-    "5️⃣ ذكّر نفسك بسبب إقلاعك واكتب شعورك في ملاحظاتك."
+    "🆘 *خطة الطوارئ في لحظة الضعف – للفتيات:*\n\n"
+    "1️⃣ غيّري وضعك فورًا يا غاليتي: إن كنتِ جالسة فقومي، وإن كنتِ على السرير فابتعدي عنه.\n"
+    "2️⃣ أغلقي ما يثيركِ من تطبيقات أو مواقع، وأبعدي الهاتف عنك قدر الإمكان.\n"
+    "3️⃣ خذي عشرة أنفاس عميقة بهدوء: شهيق من الأنف ببطء، وزفير من الفم ببطء أكثر 🌬️.\n"
+    "4️⃣ استمعي لآيات من القرآن أو سورة تحبينها، ودعي قلبك يهدأ بكلام الله 🕊.\n"
+    "5️⃣ افتحي «ملاحظاتي 📓» واكتبي ما تشعرين به الآن؛ فضفضة مكتوبة خير من صمت يؤلمك في الداخل.\n\n"
+    "تذكّري يا جميلتي: كل مرة تتجاوزين فيها لحظة ضعف، أنتِ تبنين عضلة إرادتك وتقتربين أكثر من نفسك التي تحبينها 💪🩷"
 )
 
 RELAPSE_REASONS = (
-    "🧠 *أسباب الانتكاس الشائعة:*\n"
-    "• الفراغ وعدم وجود أهداف واضحة.\n"
-    "• استخدام الهاتف في السرير ووقت متأخر.\n"
-    "• متابعة محتوى مُثير ولو كان \"بريئًا\" ظاهريًا.\n"
-    "• العزلة والابتعاد عن الناس لفترات طويلة.\n"
-    "حاول تلاحظ السبب الأقرب لك وتعالجه مباشرة 💡."
+    "🧠 *أسباب الانتكاس الشائعة عند الفتيات:*\n\n"
+    "• السهر الطويل ليلًا مع الهاتف من غير هدف واضح.\n"
+    "• متابعة محتوى أو مسلسلات تحتوي على تلميحات أو مشاهد مثيرة للفضول.\n"
+    "• الشعور بالوحدة أو الفراغ العاطفي ومحاولة الهروب من الألم الداخلي.\n"
+    "• الفراغ وعدم وجود أهداف يومية صغيرة تشغلك عن التفكير السلبي.\n"
+    "• المقارنة المستمرة بالآخرين وما يسببه ذلك من إحباط أو حزن.\n\n"
+    "حاولي يا حبيبتي أن تتعرّفي على السبب الأقرب لحالتك؛ لأن معرفة السبب نصف طريق العلاج 🌱."
 )
 
-ADHKAR_TEXTS = [
-    (
-        "🕊 *أذكار وسكينة (1):*\n"
-        "• أستغفر الله العظيم وأتوب إليه.\n"
-        "• لا إله إلا أنت سبحانك إني كنت من الظالمين.\n"
-        "• حسبي الله لا إله إلا هو عليه توكلت وهو رب العرش العظيم.\n"
-        "رددها بقلب حاضر وهدوء 🤍."
-    ),
-    (
-        "🕊 *أذكار وسكينة (2):*\n"
-        "• سبحان الله وبحمده، سبحان الله العظيم.\n"
-        "• لا حول ولا قوة إلا بالله.\n"
-        "• اللهم طهر قلبي وغض بصري واحفظ فرجي.\n"
-        "خذ دقيقة ذكر… وستشعر بالفرق 🌿."
-    ),
-]
+ADHKAR = (
+    "🕊 *أذكار وسكينة لقلبك يا جميلتي:*\n\n"
+    "• أستغفرُ اللهَ العظيمَ الذي لا إلهَ إلا هو الحيَّ القيومَ وأتوبُ إليه.\n"
+    "• لا إله إلا أنت سبحانك إني كنتُ من الظالمين.\n"
+    "• حسبي الله لا إله إلا هو، عليه توكّلتُ وهو ربُّ العرش العظيم.\n\n"
+    "ردّديها بقلب حاضر، وتيقّني أن ربّك يرى تعبك ومحاولتك، ولن يضيّع دموعك ولا نيتك الصادقة يا غاليتي 🤍."
+)
 
 # =================== أوامر البوت ===================
 
 
 def start_command(update: Update, context: CallbackContext):
     user = update.effective_user
-    is_new = str(user.id) not in data
-    get_user_record(user)
+    record, created = get_user_record(user)
 
     text = (
-        f"أهلاً {user.first_name} 🌱\n\n"
-        "هذا بوت *قاهر العادة* ليساعدك في رحلة الإقلاع عن العادة السرّية.\n"
-        "استخدم الأزرار بالأسفل لاختيار ما تحتاجه الآن 👇"
+        f"أهلاً بكِ يا جميلتي {user.first_name} 🌸\n\n"
+        "هذا بوت *قهر العادة للفتيات* 🩷\n"
+        "وُجد خصيصًا ليكون عونًا لكِ في رحلة التعافي من العادات التي تُتعب قلبك، "
+        "وتُضعف صلتكِ بنفسك الحقيقية وربِّك.\n\n"
+        "اعتبري هذا البوت صديقة رقمية تذكّرك بقيمتك، وتشجّعك، وتفرح بكل خطوة ثبات تقومين بها 🤍\n\n"
+        "استخدمي الأزرار في الأسفل لاختيار ما يناسب حالتك الآن 👇\n"
+        "⚠️ ملاحظة: هذا البوت مخصّص للفتيات فقط."
     )
 
     update.message.reply_text(text, reply_markup=MAIN_KEYBOARD, parse_mode="Markdown")
 
-    # إشعار للأدمن عند دخول مستخدم جديد لأول مرة
-    if is_new and ADMIN_ID is not None:
+    # إشعار للمشرفة عند دخول مستخدمة جديدة لأول مرة
+    if created and is_admin(ADMIN_ID):
         try:
             context.bot.send_message(
                 chat_id=ADMIN_ID,
                 text=(
-                    "👤 *مستخدم جديد دخل البوت!*\n\n"
+                    "👤 *مستخدمة جديدة دخلت إلى البوت:*\n\n"
                     f"الاسم: {user.full_name}\n"
-                    f"اليوزر: @{user.username if user.username else 'لا يوجد'}\n"
-                    f"ID: `{user.id}`"
+                    f"ID: `{user.id}`\n"
+                    f"اسم المستخدم: @{user.username if user.username else 'لا يوجد'}"
                 ),
                 parse_mode="Markdown",
             )
@@ -287,8 +285,13 @@ def start_command(update: Update, context: CallbackContext):
 
 def help_command(update: Update, context: CallbackContext):
     update.message.reply_text(
-        "استخدم الأزرار بالأسفل للتنقل بين مميزات البوت ✨\n"
-        "ولو احتجت مساعدة خاصة اضغط على زر «تواصل مع الدعم ✉️».",
+        "غاليتي 🌸\n\n"
+        "استخدمي الأزرار في الأسفل للتنقّل بين مميزات البوت:\n"
+        "• بدء الرحلة ومتابعة عدّاد التعافي.\n"
+        "• قراءة النصائح وخطة الطوارئ وأسباب الانتكاس.\n"
+        "• قراءة الأذكار وتسجيل ملاحظاتك اليومية.\n\n"
+        "وإن احتجتِ دعمًا شخصيًا، اضغطي على زر «تواصل مع الدعم ✉️» "
+        "واكتبي ما في قلبك، وسيتم إرسال رسالتك إلى المشرفة 🤍",
         reply_markup=MAIN_KEYBOARD,
     )
 
@@ -297,46 +300,44 @@ def help_command(update: Update, context: CallbackContext):
 
 def handle_start_journey(update: Update, context: CallbackContext):
     user = update.effective_user
-    record = get_user_record(user)
+    record, _ = get_user_record(user)
 
     if record.get("streak_start"):
         delta = get_streak_delta(record)
         if delta:
             human = format_streak_text(delta)
             update.message.reply_text(
-                f"🚀 رحلتك بدأت من قبل.\nمدة ثباتك الحالية: {human} 💪",
+                f"🚀 رحلتكِ في التعافي بدأت من قبل.\nمدة ثباتك الحالية: {human}.",
                 reply_markup=MAIN_KEYBOARD,
             )
             return
 
-    now = datetime.now(timezone.utc).isoformat()
-    update_user_record(user.id, streak_start=now)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    update_user_record(user.id, streak_start=now_iso)
 
     update.message.reply_text(
-        "🚀 تم بدء رحلتك بنجاح!\n"
-        "من الآن سيتم حساب مدة ثباتك عن آخر انتكاسة.\n"
-        "اثبت… وسترَى أثر هذا القرار في نفسك وحياتك 🤍",
+        "🚀 تم بدء رحلتكِ في التعافي يا حبيبتي 🌸\n"
+        "من هذه اللحظة سيبدأ العدّ لمدّة ثباتك عن العادة.",
         reply_markup=MAIN_KEYBOARD,
     )
 
 
 def handle_days_counter(update: Update, context: CallbackContext):
     user = update.effective_user
-    record = get_user_record(user)
+    record, _ = get_user_record(user)
 
     delta = get_streak_delta(record)
     if not delta:
         update.message.reply_text(
-            "لم تبدأ رحلتك بعد.\n"
-            "اضغط على زر «بدء الرحلة 🚀» لبدء العداد ✨.",
+            "لم تبدئي رحلتكِ بعد 🌱\n"
+            "اضغطي على زر «بدء الرحلة 🚀» لبدء عدّاد التعافي.",
             reply_markup=MAIN_KEYBOARD,
         )
         return
 
     human = format_streak_text(delta)
     update.message.reply_text(
-        f"⏱ مدة ثباتك حتى الآن:\n{human}\n\n"
-        "استمر… كل دقيقة تضيفها تقرّبك من النسخة التي تتمناها من نفسك 💪",
+        f"⏱ مدة تعافيكِ حتى الآن:\n{human}",
         reply_markup=MAIN_KEYBOARD,
     )
 
@@ -344,102 +345,89 @@ def handle_days_counter(update: Update, context: CallbackContext):
 def handle_tip(update: Update, context: CallbackContext):
     tip = random.choice(TIPS)
     update.message.reply_text(
-        f"💡 نصيحة اليوم:\n{tip}", reply_markup=MAIN_KEYBOARD
+        f"💖 نصيحة لقلبك اليوم:\n{tip}",
+        reply_markup=MAIN_KEYBOARD,
     )
 
 
 def handle_emergency(update: Update, context: CallbackContext):
     update.message.reply_text(
-        EMERGENCY_PLAN, reply_markup=MAIN_KEYBOARD, parse_mode="Markdown"
+        EMERGENCY_PLAN,
+        reply_markup=MAIN_KEYBOARD,
+        parse_mode="Markdown",
     )
 
 
 def handle_relapse_reasons(update: Update, context: CallbackContext):
     update.message.reply_text(
-        RELAPSE_REASONS, reply_markup=MAIN_KEYBOARD, parse_mode="Markdown"
+        RELAPSE_REASONS,
+        reply_markup=MAIN_KEYBOARD,
+        parse_mode="Markdown",
     )
 
 
 def handle_adhkar(update: Update, context: CallbackContext):
-    text = random.choice(ADHKAR_TEXTS)
     update.message.reply_text(
-        text, reply_markup=MAIN_KEYBOARD, parse_mode="Markdown"
+        ADHKAR,
+        reply_markup=MAIN_KEYBOARD,
+        parse_mode="Markdown",
     )
-
-
-def _format_notes_list(notes):
-    if not notes:
-        return "لا توجد ملاحظات بعد."
-    return "\n\n".join(f"{idx+1}. {n}" for idx, n in enumerate(notes))
 
 
 def handle_notes(update: Update, context: CallbackContext):
-    """فتح شاشة إدارة الملاحظات (عرض / إضافة / تعديل / حذف)."""
     user = update.effective_user
-    record = get_user_record(user)
+    record, _ = get_user_record(user)
     notes = record.get("notes", [])
 
-    # تفعيل وضع قائمة إدارة الملاحظات
-    WAITING_FOR_NOTE_MENU.add(user.id)
-    WAITING_FOR_NOTE.discard(user.id)
-    WAITING_FOR_NOTE_EDIT.discard(user.id)
-    WAITING_FOR_NOTE_EDIT_TEXT.discard(user.id)
-    WAITING_FOR_NOTE_DELETE.discard(user.id)
-    NOTE_EDIT_INDEX.pop(user.id, None)
-
-    notes_text = _format_notes_list(notes)
-
-    kb = ReplyKeyboardMarkup(
-        [
-            [KeyboardButton(BTN_NOTE_ADD)],
-            [KeyboardButton(BTN_NOTE_EDIT), KeyboardButton(BTN_NOTE_DELETE)],
-            [KeyboardButton(BTN_CANCEL)],
-        ],
-        resize_keyboard=True,
-    )
-
-    update.message.reply_text(
-        f"📓 ملاحظاتك:\n\n{notes_text}\n\n"
-        "اختر ما تريد فعله من الأزرار 👇",
-        reply_markup=kb,
-    )
+    if not notes:
+        update.message.reply_text(
+            "📓 لا توجد ملاحظات بعد.\n"
+            "أرسلي أي جملة تريدين حفظها، وسأضيفها إلى ملاحظاتك يا جميلتي.",
+            reply_markup=MAIN_KEYBOARD,
+        )
+    else:
+        last_notes = notes[-20:]
+        joined = "\n\n".join(f"{idx+1}. {n}" for idx, n in enumerate(last_notes))
+        update.message.reply_text(
+            f"📓 آخر ملاحظاتك:\n\n{joined}\n\n"
+            "📝 يمكنك إرسال ملاحظة جديدة في أي وقت، وسأقوم بحفظها لكِ.",
+            reply_markup=MAIN_KEYBOARD,
+        )
 
 
 def handle_reset_counter(update: Update, context: CallbackContext):
     user = update.effective_user
-    record = get_user_record(user)
+    record, _ = get_user_record(user)
 
     if not record.get("streak_start"):
         update.message.reply_text(
             "العداد لم يُضبط بعد.\n"
-            "يمكنك البدء من جديد عبر زر «بدء الرحلة 🚀».",
+            "يمكنك البدء عبر زر «بدء الرحلة 🚀».",
             reply_markup=MAIN_KEYBOARD,
         )
         return
 
-    now = datetime.now(timezone.utc).isoformat()
-    update_user_record(user.id, streak_start=now)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    update_user_record(user.id, streak_start=now_iso)
 
     update.message.reply_text(
-        "♻️ تم إعادة ضبط العداد.\n"
-        "اعتبرها بداية جديدة أقوى وأكثر وعيًا بإذن الله 🌱.",
+        "♻️ تم إعادة ضبط عدّاد التعافي.\n"
+        "اعتبريها بداية جديدة أقوى بإذن الله يا غاليتي 🤍",
         reply_markup=MAIN_KEYBOARD,
     )
 
 
 def handle_contact_support(update: Update, context: CallbackContext):
     user = update.effective_user
-    get_user_record(user)
-
     WAITING_FOR_SUPPORT.add(user.id)
 
-    cancel_kb = ReplyKeyboardMarkup([[KeyboardButton(BTN_CANCEL)]], resize_keyboard=True)
-
     update.message.reply_text(
-        "✉️ اكتب الآن رسالتك التي تريد إرسالها للدعم.\n"
-        "حاول أن تشرح وضعك أو سؤالك بهدوء… وسنقرأه باهتمام 🤍\n\n"
-        "لو حاب تلغي اضغط «إلغاء ❌».",
-        reply_markup=cancel_kb,
+        "✉️ غاليتي، اكتبي الآن رسالتك التي تودّين إرسالها إلى *المشرفة*.\n\n"
+        "يمكنك أن تشرحي ما تشعرين به، أو موقفًا مرّ عليكِ، أو انتكاسة حدثت، "
+        "أو مجرد فضفضة تحتاج إلى من يسمعها.\n\n"
+        "إن أحببتِ التراجع، اضغطي على زر «إلغاء ❌».",
+        reply_markup=SUPPORT_KEYBOARD,
+        parse_mode="Markdown",
     )
 
 
@@ -447,18 +435,16 @@ def handle_broadcast_button(update: Update, context: CallbackContext):
     user = update.effective_user
     if not is_admin(user.id):
         update.message.reply_text(
-            "هذه الميزة خاصة بالمشرف فقط 👨‍💻", reply_markup=MAIN_KEYBOARD
+            "هذه الميزة خاصة بالمشرفة فقط 👩‍💻",
+            reply_markup=MAIN_KEYBOARD,
         )
         return
 
     WAITING_FOR_BROADCAST.add(user.id)
-    cancel_kb = ReplyKeyboardMarkup([[KeyboardButton(BTN_CANCEL)]], resize_keyboard=True)
-
     update.message.reply_text(
-        "📢 اكتب الآن الرسالة التي تريد إرسالها لجميع مستخدمي البوت.\n"
-        "يمكنك مثلاً إرسال تذكير، تشجيع، أو إعلان هام.\n\n"
-        "للإلغاء اضغط «إلغاء ❌».",
-        reply_markup=cancel_kb,
+        "📢 ارسلي الآن الرسالة التي تريدين إرسالها إلى جميع المشتركات في البوت.\n\n"
+        "إن أردتِ الإلغاء، اضغطي على زر «إلغاء ❌».",
+        reply_markup=BROADCAST_KEYBOARD,
     )
 
 
@@ -466,54 +452,211 @@ def handle_stats_button(update: Update, context: CallbackContext):
     user = update.effective_user
     if not is_admin(user.id):
         update.message.reply_text(
-            "هذه المعلومة خاصة بالمشرف فقط 👨‍💻", reply_markup=MAIN_KEYBOARD
+            "هذه المعلومة خاصة بالمشرفة فقط 👩‍💻",
+            reply_markup=MAIN_KEYBOARD,
         )
         return
 
     total_users = len(get_all_user_ids())
     update.message.reply_text(
-        f"👥 عدد المستخدمين المسجلين في البوت: *{total_users}*",
+        f"👥 عدد المشتركات المسجّلات في البوت: *{total_users}*",
         parse_mode="Markdown",
         reply_markup=MAIN_KEYBOARD,
     )
 
+# =================== الهاندلر العام للرسائل ===================
 
-def handle_rating_button(update: Update, context: CallbackContext):
+
+def handle_text_message(update: Update, context: CallbackContext):
     user = update.effective_user
-    WAITING_FOR_RATING.add(user.id)
+    user_id = user.id
+    text = (update.message.text or "").strip()
 
-    kb = ReplyKeyboardMarkup(
-        [
-            [KeyboardButton("1"), KeyboardButton("2"), KeyboardButton("3")],
-            [KeyboardButton("4"), KeyboardButton("5")],
-            [KeyboardButton(BTN_CANCEL)],
-        ],
-        resize_keyboard=True,
-    )
+    record, _ = get_user_record(user)
+
+    # زر إلغاء
+    if text == BTN_CANCEL:
+        if user_id in WAITING_FOR_SUPPORT:
+            WAITING_FOR_SUPPORT.discard(user_id)
+            update.message.reply_text(
+                "تم إلغاء رسالة الدعم.\n"
+                "يمكنك العودة لاستخدام الأزرار في الأسفل يا جميلتي 🌸",
+                reply_markup=MAIN_KEYBOARD,
+            )
+            return
+        if user_id in WAITING_FOR_BROADCAST:
+            WAITING_FOR_BROADCAST.discard(user_id)
+            update.message.reply_text(
+                "تم إلغاء وضع الرسالة الجماعية.\n"
+                "يمكنك العودة لاستخدام بقية المميزات 🌿",
+                reply_markup=MAIN_KEYBOARD,
+            )
+            return
+
+    # 1️⃣ لو المشرفة ردّت بالـ Reply على رسالة دعم
+    if is_admin(user_id) and update.message.reply_to_message:
+        # نحاول استخراج ID من نص الرسالة الأصلية
+        original_text = update.message.reply_to_message.text or ""
+        target_id = None
+        # نبحث عن سطر فيه ID: رقم
+        for line in original_text.splitlines():
+            line = line.strip()
+            if line.startswith("ID:"):
+                try:
+                    parts = line.split("ID:")[1].strip()
+                    # قد يكون على الشكل `12345`
+                    parts = parts.replace("`", "").strip()
+                    target_id = int(parts)
+                except Exception:
+                    target_id = None
+                break
+
+        if target_id:
+            try:
+                context.bot.send_message(
+                    chat_id=target_id,
+                    text=(
+                        "💌 ردّ من المشرفة:\n\n"
+                        f"{text}"
+                    ),
+                )
+                update.message.reply_text(
+                    "✅ تم إرسال ردّكِ إلى المشتركة.",
+                    reply_markup=MAIN_KEYBOARD,
+                )
+            except Exception as e:
+                logger.error(f"Error sending reply to user {target_id}: {e}")
+                update.message.reply_text(
+                    "حدث خطأ أثناء إرسال الرسالة للمشتركة.",
+                    reply_markup=MAIN_KEYBOARD,
+                )
+        else:
+            update.message.reply_text(
+                "لم أستطع تحديد هوية المشتركة من هذه الرسالة.\n"
+                "تأكدي أنكِ تردّين على رسالة دعم تحتوي على سطر ID.",
+                reply_markup=MAIN_KEYBOARD,
+            )
+        return
+
+    # 2️⃣ وضع "تواصل مع الدعم"
+    if user_id in WAITING_FOR_SUPPORT:
+        WAITING_FOR_SUPPORT.discard(user_id)
+
+        support_msg = (
+            "📩 *رسالة جديدة إلى المشرفة:*\n\n"
+            f"الاسم: {user.full_name}\n"
+            f"ID: `{user_id}`\n"
+            f"اسم المستخدم: @{user.username if user.username else 'لا يوجد'}\n\n"
+            f"✉️ محتوى الرسالة:\n{text}"
+        )
+
+        if ADMIN_ID is not None:
+            try:
+                context.bot.send_message(
+                    chat_id=ADMIN_ID,
+                    text=support_msg,
+                    parse_mode="Markdown",
+                )
+            except Exception as e:
+                logger.error(f"Error sending support message to admin: {e}")
+
+        update.message.reply_text(
+            "✅ تم إرسال رسالتكِ إلى المشرفة يا حبيبتي.\n"
+            "سيتم الاطلاع عليها والرد عليكِ إن لزم الأمر بإذن الله 🤍",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return
+
+    # 3️⃣ وضع "رسالة جماعية" (للمشرفة فقط)
+    if user_id in WAITING_FOR_BROADCAST:
+        WAITING_FOR_BROADCAST.discard(user_id)
+
+        if not is_admin(user_id):
+            update.message.reply_text(
+                "هذه الميزة خاصة بالمشرفة فقط 👩‍💻",
+                reply_markup=MAIN_KEYBOARD,
+            )
+            return
+
+        user_ids = get_all_user_ids()
+        sent = 0
+        for uid in user_ids:
+            try:
+                context.bot.send_message(
+                    chat_id=uid,
+                    text=(
+                        "📢 رسالة من المشرفة:\n\n"
+                        f"{text}\n\n"
+                        "إن أردتِ الرد على هذه الرسالة:\n"
+                        "1️⃣ اضغطي على الرسالة مطوّلًا.\n"
+                        "2️⃣ اختاري Reply / الرد.\n"
+                        "3️⃣ اكتبي رسالتك بعدها ليصل ردّكِ إلى المشرفة 💌."
+                    ),
+                )
+                sent += 1
+            except Exception as e:
+                logger.error(f"Error sending broadcast to {uid}: {e}")
+
+        update.message.reply_text(
+            f"✅ تم إرسال الرسالة إلى {sent} مشتركة.",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return
+
+    # 4️⃣ التعامل مع الأزرار
+    if text == BTN_START:
+        handle_start_journey(update, context)
+        return
+    if text == BTN_COUNTER:
+        handle_days_counter(update, context)
+        return
+    if text == BTN_TIP:
+        handle_tip(update, context)
+        return
+    if text == BTN_EMERGENCY:
+        handle_emergency(update, context)
+        return
+    if text == BTN_RELAPSE:
+        handle_relapse_reasons(update, context)
+        return
+    if text == BTN_DHIKR:
+        handle_adhkar(update, context)
+        return
+    if text == BTN_NOTES:
+        handle_notes(update, context)
+        return
+    if text == BTN_RESET:
+        handle_reset_counter(update, context)
+        return
+    if text == BTN_SUPPORT:
+        handle_contact_support(update, context)
+        return
+    if text == BTN_BROADCAST:
+        handle_broadcast_button(update, context)
+        return
+    if text == BTN_STATS:
+        handle_stats_button(update, context)
+        return
+
+    # 5️⃣ أي نص آخر من المشتركة → نعتبره ملاحظة + تنبيه أنه لا يصل للمشرفة
+    notes = record.get("notes", [])
+    notes.append(text)
+    update_user_record(user_id, notes=notes)
 
     update.message.reply_text(
-        "⭐ قيّم يومك من 1 إلى 5:\n"
-        "1 = كان صعب جدًا\n"
-        "5 = ممتاز وثابت ولله الحمد 🌟\n\n"
-        "اختر رقمًا أو اضغط «إلغاء ❌».",
-        reply_markup=kb,
+        "📝 تم حفظ رسالتكِ كملاحظة شخصية داخل البوت.\n\n"
+        "⚠️ تنبيه يا غاليتي:\n"
+        "هذه الرسالة لا تصل إلى *المشرفة* بشكل مباشر.\n\n"
+        "إن أردتِ التواصل مع المشرفة:\n"
+        "1️⃣ اضغطي على زر «تواصل مع الدعم ✉️» في الأسفل.\n"
+        "2️⃣ أو اضغطي على رسالة سابقة جاءتْك من المشرفة في الخاص، "
+        "ثم اختاري Reply / الرد واكتبي رسالتك بعدها.\n\n"
+        "بهذه الطريقة تضمنين أن رسالتك تصل إلى المشرفة وتتم متابعتها بإذن الله 💌",
+        reply_markup=MAIN_KEYBOARD,
+        parse_mode="Markdown",
     )
 
-
-def handle_set_start_button(update: Update, context: CallbackContext):
-    user = update.effective_user
-    WAITING_FOR_CUSTOM_START.add(user.id)
-
-    kb = ReplyKeyboardMarkup([[KeyboardButton(BTN_CANCEL)]], resize_keyboard=True)
-
-    update.message.reply_text(
-        "⏱ اكتب عدد *الأيام* التي ثبَتَّ فيها حتى الآن قبل استخدام البوت.\n"
-        "مثال: اكتب فقط الرقم: 7\n\n"
-        "للإلغاء اضغط «إلغاء ❌».",
-        reply_markup=kb,
-    )
-
-# =================== تذكير يومي ===================
+# =================== التذكير اليومي ===================
 
 
 def send_daily_reminders(context: CallbackContext):
@@ -524,448 +667,16 @@ def send_daily_reminders(context: CallbackContext):
             context.bot.send_message(
                 chat_id=uid,
                 text=(
-                    "🤍 تذكير لطيف:\n"
-                    "أنت لست وحدك في هذه الرحلة.\n"
-                    "خذ دقيقة لتتذكر سبب إقلاعك، واضغط على أي زر تحتاجه الآن ✨."
+                    "🤍 *تذكير لطيف لقلبك يا غاليتي:*\n\n"
+                    "أنتِ لستِ وحدك في هذه الرحلة، وهناك الكثير من الفتيات يجاهدن مثلك تمامًا.\n"
+                    "خذي دقيقة الآن لتستحضري سبب رغبتك في التعافي، وتذكّري أنكِ تستحقين قلبًا نقيًّا "
+                    "ونفسًا مطمئنة.\n\n"
+                    "اضغطي على الزر الذي تحتاجينه الآن في البوت، ولا تخجلي من طلب العون متى احتجتِ 🌸."
                 ),
+                parse_mode="Markdown",
             )
         except Exception as e:
             logger.error(f"Error sending daily reminder to {uid}: {e}")
-
-# =================== هاندلر الرسائل ===================
-
-
-def handle_text_message(update: Update, context: CallbackContext):
-    user = update.effective_user
-    user_id = user.id
-    msg = update.message
-    text = (msg.text or "").strip()
-
-    record = get_user_record(user)
-
-    # 1️⃣ زر الإلغاء العام
-    if text == BTN_CANCEL:
-        WAITING_FOR_SUPPORT.discard(user_id)
-        WAITING_FOR_BROADCAST.discard(user_id)
-        WAITING_FOR_NOTE.discard(user_id)
-        WAITING_FOR_NOTE_MENU.discard(user_id)
-        WAITING_FOR_NOTE_EDIT.discard(user_id)
-        WAITING_FOR_NOTE_EDIT_TEXT.discard(user_id)
-        WAITING_FOR_NOTE_DELETE.discard(user_id)
-        WAITING_FOR_RATING.discard(user_id)
-        WAITING_FOR_CUSTOM_START.discard(user_id)
-        NOTE_EDIT_INDEX.pop(user_id, None)
-
-        msg.reply_text(
-            "تم الإلغاء ✅\nرجعتك للقائمة الرئيسية ✨",
-            reply_markup=MAIN_KEYBOARD,
-        )
-        return
-
-    # 2️⃣ رد الأدمن على رسالة فيها ID → يرسل للمستخدم
-    if is_admin(user_id) and msg.reply_to_message:
-        original = msg.reply_to_message.text or ""
-        m = re.search(r"ID:\s*`(\d+)`", original)
-        if m:
-            target_id = int(m.group(1))
-            try:
-                context.bot.send_message(
-                    chat_id=target_id,
-                    text=f"💌 رد من الدعم:\n\n{text}",
-                    reply_markup=MAIN_KEYBOARD,
-                )
-                msg.reply_text(
-                    "✅ تم إرسال ردّك للمستخدم.",
-                    reply_markup=MAIN_KEYBOARD,
-                )
-            except Exception as e:
-                logger.error(f"Error sending admin reply to {target_id}: {e}")
-                msg.reply_text(
-                    "حدث خطأ أثناء إرسال الرد للمستخدم ⚠️.",
-                    reply_markup=MAIN_KEYBOARD,
-                )
-            return
-
-    # 3️⃣ قائمة إدارة الملاحظات
-    if user_id in WAITING_FOR_NOTE_MENU:
-        notes = record.get("notes", [])
-
-        if text == BTN_NOTE_ADD:
-            WAITING_FOR_NOTE_MENU.discard(user_id)
-            WAITING_FOR_NOTE.add(user_id)
-            kb = ReplyKeyboardMarkup(
-                [[KeyboardButton(BTN_CANCEL)]],
-                resize_keyboard=True,
-            )
-            msg.reply_text(
-                "📝 أرسل الآن الملاحظة التي تريد حفظها.\n"
-                "لو حاب تلغي اضغط «إلغاء ❌».",
-                reply_markup=kb,
-            )
-            return
-
-        if text == BTN_NOTE_EDIT:
-            if not notes:
-                msg.reply_text(
-                    "📓 لا توجد ملاحظات لتعديلها حاليًا.",
-                    reply_markup=MAIN_KEYBOARD,
-                )
-                WAITING_FOR_NOTE_MENU.discard(user_id)
-                return
-
-            WAITING_FOR_NOTE_MENU.discard(user_id)
-            WAITING_FOR_NOTE_EDIT.add(user_id)
-            notes_text = _format_notes_list(notes)
-            kb = ReplyKeyboardMarkup(
-                [[KeyboardButton(BTN_CANCEL)]],
-                resize_keyboard=True,
-            )
-            msg.reply_text(
-                f"✏️ اختر رقم الملاحظة التي تريد تعديلها:\n\n{notes_text}\n\n"
-                "أرسل الرقم الآن، أو اضغط «إلغاء ❌».",
-                reply_markup=kb,
-            )
-            return
-
-        if text == BTN_NOTE_DELETE:
-            if not notes:
-                msg.reply_text(
-                    "📓 لا توجد ملاحظات لحذفها حاليًا.",
-                    reply_markup=MAIN_KEYBOARD,
-                )
-                WAITING_FOR_NOTE_MENU.discard(user_id)
-                return
-
-            WAITING_FOR_NOTE_MENU.discard(user_id)
-            WAITING_FOR_NOTE_DELETE.add(user_id)
-            notes_text = _format_notes_list(notes)
-            kb = ReplyKeyboardMarkup(
-                [[KeyboardButton(BTN_CANCEL)]],
-                resize_keyboard=True,
-            )
-            msg.reply_text(
-                f"🗑 اختر رقم الملاحظة التي تريد حذفها:\n\n{notes_text}\n\n"
-                "أرسل الرقم الآن، أو اضغط «إلغاء ❌».",
-                reply_markup=kb,
-            )
-            return
-
-        # لو كتب شيء آخر داخل القائمة
-        msg.reply_text(
-            "اختر من الأزرار المتاحة لإدارة ملاحظاتك 👇",
-            reply_markup=ReplyKeyboardMarkup(
-                [
-                    [KeyboardButton(BTN_NOTE_ADD)],
-                    [KeyboardButton(BTN_NOTE_EDIT), KeyboardButton(BTN_NOTE_DELETE)],
-                    [KeyboardButton(BTN_CANCEL)],
-                ],
-                resize_keyboard=True,
-            ),
-        )
-        return
-
-    # 4️⃣ اختيار رقم ملاحظة للتعديل
-    if user_id in WAITING_FOR_NOTE_EDIT:
-        notes = record.get("notes", [])
-        try:
-            idx = int(text) - 1
-            if idx < 0 or idx >= len(notes):
-                raise ValueError()
-        except ValueError:
-            kb = ReplyKeyboardMarkup(
-                [[KeyboardButton(BTN_CANCEL)]],
-                resize_keyboard=True,
-            )
-            msg.reply_text(
-                "رجاءً أرسل رقم صحيح من القائمة، أو اضغط «إلغاء ❌».",
-                reply_markup=kb,
-            )
-            return
-
-        NOTE_EDIT_INDEX[user_id] = idx
-        WAITING_FOR_NOTE_EDIT.discard(user_id)
-        WAITING_FOR_NOTE_EDIT_TEXT.add(user_id)
-
-        kb = ReplyKeyboardMarkup(
-            [[KeyboardButton(BTN_CANCEL)]],
-            resize_keyboard=True,
-        )
-        msg.reply_text(
-            f"✏️ أرسل النص الجديد للملاحظة رقم {idx+1}:",
-            reply_markup=kb,
-        )
-        return
-
-    # 5️⃣ استلام النص الجديد بعد اختيار رقم الملاحظة
-    if user_id in WAITING_FOR_NOTE_EDIT_TEXT:
-        notes = record.get("notes", [])
-        idx = NOTE_EDIT_INDEX.get(user_id)
-        if idx is None or idx < 0 or idx >= len(notes):
-            # لو حصل لخبطة نرجع للقائمة الرئيسية
-            WAITING_FOR_NOTE_EDIT_TEXT.discard(user_id)
-            NOTE_EDIT_INDEX.pop(user_id, None)
-            msg.reply_text(
-                "حصل خطأ بسيط في اختيار الملاحظة، جرّب مرة أخرى من «ملاحظاتي 📓».",
-                reply_markup=MAIN_KEYBOARD,
-            )
-            return
-
-        notes[idx] = text
-        update_user_record(user_id, notes=notes)
-
-        WAITING_FOR_NOTE_EDIT_TEXT.discard(user_id)
-        NOTE_EDIT_INDEX.pop(user_id, None)
-
-        msg.reply_text(
-            "✅ تم تعديل الملاحظة بنجاح.\n"
-            "تقدر ترجع لـ «ملاحظاتي 📓» لو حاب تشوف التغييرات.",
-            reply_markup=MAIN_KEYBOARD,
-        )
-        return
-
-    # 6️⃣ اختيار رقم ملاحظة للحذف
-    if user_id in WAITING_FOR_NOTE_DELETE:
-        notes = record.get("notes", [])
-        try:
-            idx = int(text) - 1
-            if idx < 0 or idx >= len(notes):
-                raise ValueError()
-        except ValueError:
-            kb = ReplyKeyboardMarkup(
-                [[KeyboardButton(BTN_CANCEL)]],
-                resize_keyboard=True,
-            )
-            msg.reply_text(
-                "رجاءً أرسل رقم صحيح من القائمة، أو اضغط «إلغاء ❌».",
-                reply_markup=kb,
-            )
-            return
-
-        deleted = notes.pop(idx)
-        update_user_record(user_id, notes=notes)
-        WAITING_FOR_NOTE_DELETE.discard(user_id)
-
-        msg.reply_text(
-            f"🗑 تم حذف الملاحظة:\n\n{deleted}",
-            reply_markup=MAIN_KEYBOARD,
-        )
-        return
-
-    # 7️⃣ وضع "تواصل مع الدعم"
-    if user_id in WAITING_FOR_SUPPORT:
-        WAITING_FOR_SUPPORT.discard(user_id)
-
-        support_msg = (
-            "📩 *رسالة جديدة للدعم:*\n\n"
-            f"👤 الاسم: {user.full_name}\n"
-            f"🆔 ID: `{user_id}`\n"
-            f"🔹 اسم المستخدم: @{user.username if user.username else 'لا يوجد'}\n\n"
-            f"✉️ محتوى الرسالة:\n{text}"
-        )
-
-        if ADMIN_ID is not None:
-            try:
-                context.bot.send_message(
-                    chat_id=ADMIN_ID, text=support_msg, parse_mode="Markdown"
-                )
-            except Exception as e:
-                logger.error(f"Error sending support message to admin: {e}")
-
-        msg.reply_text(
-            "✅ تم إرسال رسالتك للدعم.\n"
-            "سيتم التواصل معك إن لزم الأمر 🤍",
-            reply_markup=MAIN_KEYBOARD,
-        )
-        return
-
-    # 8️⃣ وضع "رسالة جماعية"
-    if user_id in WAITING_FOR_BROADCAST:
-        WAITING_FOR_BROADCAST.discard(user_id)
-
-        if not is_admin(user_id):
-            msg.reply_text(
-                "هذه الميزة خاصة بالمشرف فقط 👨‍💻", reply_markup=MAIN_KEYBOARD
-            )
-            return
-
-        user_ids = get_all_user_ids()
-        sent = 0
-        for uid in user_ids:
-            try:
-                context.bot.send_message(
-                    chat_id=uid,
-                    text=f"📢 رسالة من الدعم:\n\n{text}",
-                )
-                sent += 1
-            except Exception as e:
-                logger.error(f"Error sending broadcast to {uid}: {e}")
-
-        msg.reply_text(
-            f"✅ تم إرسال الرسالة إلى {sent} مستخدم.",
-            reply_markup=MAIN_KEYBOARD,
-        )
-        return
-
-    # 9️⃣ وضع "إضافة ملاحظة جديدة"
-    if user_id in WAITING_FOR_NOTE:
-        notes = record.get("notes", [])
-        notes.append(text)
-        update_user_record(user_id, notes=notes)
-
-        msg.reply_text(
-            "📝 تم حفظ ملاحظتك.\n"
-            "استخدم زر «ملاحظاتي 📓» لعرض آخر ما كتبت.",
-            reply_markup=MAIN_KEYBOARD,
-        )
-        WAITING_FOR_NOTE.discard(user_id)
-        return
-
-    # 🔟 وضع "تقييم اليوم"
-    if user_id in WAITING_FOR_RATING:
-        if text not in {"1", "2", "3", "4", "5"}:
-            msg.reply_text(
-                "رجاءً اختر رقم من 1 إلى 5 ⭐\nأو اضغط «إلغاء ❌».",
-                reply_markup=ReplyKeyboardMarkup(
-                    [
-                        [KeyboardButton("1"), KeyboardButton("2"), KeyboardButton("3")],
-                        [KeyboardButton("4"), KeyboardButton("5")],
-                        [KeyboardButton(BTN_CANCEL)],
-                    ],
-                    resize_keyboard=True,
-                ),
-            )
-            return
-
-        rating_value = int(text)
-        ratings = record.get("ratings", [])
-        ratings.append(
-            {
-                "value": rating_value,
-                "at": datetime.now(timezone.utc).isoformat(),
-            }
-        )
-        update_user_record(user_id, ratings=ratings)
-
-        msg.reply_text(
-            f"⭐ تم تسجيل تقييمك لليوم: {rating_value}/5\n"
-            "شكرًا لصدقك مع نفسك، هذا يساعدك تفهم نمط أيامك أكثر 🌿.",
-            reply_markup=MAIN_KEYBOARD,
-        )
-        WAITING_FOR_RATING.discard(user_id)
-        return
-
-    # 1️⃣1️⃣ وضع "تعيين بداية التعافي"
-    if user_id in WAITING_FOR_CUSTOM_START:
-        try:
-            days = int(text)
-            if days < 0:
-                raise ValueError()
-        except ValueError:
-            msg.reply_text(
-                "رجاءً أرسل رقم أيام صحيح (مثال: 7) أو اضغط «إلغاء ❌».",
-                reply_markup=ReplyKeyboardMarkup(
-                    [[KeyboardButton(BTN_CANCEL)]], resize_keyboard=True
-                ),
-            )
-            return
-
-        now = datetime.now(timezone.utc)
-        start_dt = now - timedelta(days=days)
-        update_user_record(user_id, streak_start=start_dt.isoformat())
-
-        human = format_streak_text(now - start_dt)
-        msg.reply_text(
-            f"⏱ تم تعيين بداية التعافي منذ {human}.\n"
-            "سيتم احتساب العداد بناءً على هذه المدة 🌟.",
-            reply_markup=MAIN_KEYBOARD,
-        )
-        WAITING_FOR_CUSTOM_START.discard(user_id)
-        return
-
-    # 1️⃣2️⃣ رد المستخدم على رسالة من البوت (دعم/رسالة جماعية)
-    if (
-        not is_admin(user_id)
-        and msg.reply_to_message
-        and msg.reply_to_message.from_user.id == context.bot.id
-    ):
-        original_text = msg.reply_to_message.text or ""
-        if original_text.startswith("📢 رسالة من الدعم") or original_text.startswith(
-            "💌 رد من الدعم"
-        ):
-            support_msg = (
-                "📩 *رد جديد على رسالة الدعم/الرسالة الجماعية:*\n\n"
-                f"👤 الاسم: {user.full_name}\n"
-                f"🆔 ID: `{user_id}`\n"
-                f"🔹 اسم المستخدم: @{user.username if user.username else 'لا يوجد'}\n\n"
-                f"✉️ محتوى الرد:\n{text}"
-            )
-
-            if ADMIN_ID is not None:
-                try:
-                    context.bot.send_message(
-                        chat_id=ADMIN_ID,
-                        text=support_msg,
-                        parse_mode="Markdown",
-                    )
-                except Exception as e:
-                    logger.error(f"Error sending reply-on-broadcast to admin: {e}")
-
-            msg.reply_text(
-                "✅ تم إرسال ردّك إلى الدعم.\n"
-                "شكرًا على مشاركتك 🤍.",
-                reply_markup=MAIN_KEYBOARD,
-            )
-            return
-
-    # 1️⃣3️⃣ الأزرار الرئيسية
-    if text == BTN_START:
-        start_command(update, context)
-        return
-    elif text == BTN_COUNTER:
-        handle_days_counter(update, context)
-        return
-    elif text == BTN_TIP:
-        handle_tip(update, context)
-        return
-    elif text == BTN_EMERGENCY:
-        handle_emergency(update, context)
-        return
-    elif text == BTN_RELAPSE:
-        handle_relapse_reasons(update, context)
-        return
-    elif text == BTN_DHIKR:
-        handle_adhkar(update, context)
-        return
-    elif text == BTN_NOTES:
-        handle_notes(update, context)
-        return
-    elif text == BTN_RESET:
-        handle_reset_counter(update, context)
-        return
-    elif text == BTN_SUPPORT:
-        handle_contact_support(update, context)
-        return
-    elif text == BTN_BROADCAST:
-        handle_broadcast_button(update, context)
-        return
-    elif text == BTN_STATS:
-        handle_stats_button(update, context)
-        return
-    elif text == BTN_RATING:
-        handle_rating_button(update, context)
-        return
-    elif text == BTN_SET_START:
-        handle_set_start_button(update, context)
-        return
-
-    # 1️⃣4️⃣ أي رسالة عشوائية ليست زر ولا وضع خاص → تنبيه
-    msg.reply_text(
-        "⚠️ تنبيه: رسالتك هذه لا تصل للأدمن بشكل مباشر.\n"
-        "لو حاب تتواصل مع الدعم:\n"
-        "1️⃣ اضغط على زر «تواصل مع الدعم ✉️»\n"
-        "2️⃣ أو اضغط على الرسالة، ثم اختر Reply / الرد واكتب رسالتك",
-        reply_markup=MAIN_KEYBOARD,
-    )
 
 # =================== تشغيل البوت ===================
 
@@ -976,21 +687,19 @@ def main():
 
     updater = Updater(BOT_TOKEN, use_context=True)
     dp = updater.dispatcher
-    job_queue = updater.job_queue
 
     # أوامر
     dp.add_handler(CommandHandler("start", start_command))
     dp.add_handler(CommandHandler("help", help_command))
 
     # جميع الرسائل النصية
-    dp.add_handler(
-        MessageHandler(Filters.text & ~Filters.command, handle_text_message)
-    )
+    dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_text_message))
 
-    # تذكير يومي الساعة 20:00 بتوقيت UTC
+    # جدولة تذكير يومي عن طريق JobQueue (الساعة 20:00 بتوقيت UTC)
+    job_queue = updater.job_queue
     job_queue.run_daily(
         send_daily_reminders,
-        time=time(hour=20, minute=0, tzinfo=pytz.UTC),
+        time=time(hour=20, minute=0, tzinfo=pytz.utc),
         name="daily_reminders",
     )
 
