@@ -27,15 +27,22 @@ from telegram.ext import (
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATA_FILE = "user_data.json"
 
-# ضع هنا ID الأدمن (بدون علامات تنصيص)
+# ضع هنا ID الأدمن
 ADMIN_ID = 931350292  # عدّل هذا للـ ID تبعك
 
 # حالات المستخدمين
 WAITING_FOR_SUPPORT = set()
 WAITING_FOR_BROADCAST = set()
-WAITING_FOR_NOTE = set()
+WAITING_FOR_NOTE = set()              # لإضافة ملاحظة جديدة فقط
+WAITING_FOR_NOTE_MENU = set()         # قائمة إدارة الملاحظات
+WAITING_FOR_NOTE_EDIT = set()         # اختيار رقم ملاحظة للتعديل
+WAITING_FOR_NOTE_EDIT_TEXT = set()    # إرسال نص جديد بعد اختيار الرقم
+WAITING_FOR_NOTE_DELETE = set()       # اختيار رقم ملاحظة للحذف
 WAITING_FOR_RATING = set()
 WAITING_FOR_CUSTOM_START = set()
+
+# خريطة لحفظ رقم الملاحظة المؤقت أثناء التعديل
+NOTE_EDIT_INDEX = {}
 
 # ملف اللوج
 logging.basicConfig(
@@ -128,7 +135,7 @@ def is_admin(user_id: int) -> bool:
 # =================== حساب مدة الثبات ===================
 
 
-def get_streak_delta(record) -> timedelta | None:
+def get_streak_delta(record):
     start_iso = record.get("streak_start")
     if not start_iso:
         return None
@@ -147,6 +154,7 @@ def format_streak_text(delta: timedelta) -> str:
     total_minutes = int(delta.total_seconds() // 60)
     total_hours = int(delta.total_seconds() // 3600)
     total_days = int(delta.total_seconds() // 86400)
+    # تقريب الأشهر 30 يوم
     months = total_days // 30
     days = total_days % 30
     hours = total_hours % 24
@@ -180,6 +188,11 @@ BTN_SUPPORT = "تواصل مع الدعم ✉️"
 BTN_BROADCAST = "رسالة جماعية 📢"
 BTN_STATS = "عدد المستخدمين 👥"
 BTN_CANCEL = "إلغاء ❌"
+
+# أزرار إدارة الملاحظات
+BTN_NOTE_ADD = "➕ إضافة ملاحظة جديدة"
+BTN_NOTE_EDIT = "✏️ تعديل ملاحظة"
+BTN_NOTE_DELETE = "🗑 حذف ملاحظة"
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
@@ -245,7 +258,7 @@ ADHKAR_TEXTS = [
 def start_command(update: Update, context: CallbackContext):
     user = update.effective_user
     is_new = str(user.id) not in data
-    record = get_user_record(user)
+    get_user_record(user)
 
     text = (
         f"أهلاً {user.first_name} 🌱\n\n"
@@ -255,8 +268,8 @@ def start_command(update: Update, context: CallbackContext):
 
     update.message.reply_text(text, reply_markup=MAIN_KEYBOARD, parse_mode="Markdown")
 
-    # إشعار للأدمن عند دخول مستخدم جديد
-    if is_new and is_admin(ADMIN_ID):
+    # إشعار للأدمن عند دخول مستخدم جديد لأول مرة
+    if is_new and ADMIN_ID is not None:
         try:
             context.bot.send_message(
                 chat_id=ADMIN_ID,
@@ -354,30 +367,42 @@ def handle_adhkar(update: Update, context: CallbackContext):
     )
 
 
+def _format_notes_list(notes):
+    if not notes:
+        return "لا توجد ملاحظات بعد."
+    return "\n\n".join(f"{idx+1}. {n}" for idx, n in enumerate(notes))
+
+
 def handle_notes(update: Update, context: CallbackContext):
+    """فتح شاشة إدارة الملاحظات (عرض / إضافة / تعديل / حذف)."""
     user = update.effective_user
     record = get_user_record(user)
     notes = record.get("notes", [])
 
-    WAITING_FOR_NOTE.add(user.id)
+    # تفعيل وضع قائمة إدارة الملاحظات
+    WAITING_FOR_NOTE_MENU.add(user.id)
+    WAITING_FOR_NOTE.discard(user.id)
+    WAITING_FOR_NOTE_EDIT.discard(user.id)
+    WAITING_FOR_NOTE_EDIT_TEXT.discard(user.id)
+    WAITING_FOR_NOTE_DELETE.discard(user.id)
+    NOTE_EDIT_INDEX.pop(user.id, None)
 
-    if not notes:
-        msg = (
-            "📓 لا توجد ملاحظات بعد.\n"
-            "اكتب الآن أي شعور، فكرة، أو موقف تريد حفظه في رحلتك 🖊\n\n"
-            "لو حاب تلغي اضغط «إلغاء ❌»."
-        )
-    else:
-        last_notes = "\n\n".join(f"{idx+1}. {n}" for idx, n in enumerate(notes[-10:]))
-        msg = (
-            "📓 آخر ملاحظاتك:\n\n"
-            f"{last_notes}\n\n"
-            "اكتب الآن ملاحظة جديدة تُعبّر عن حالتك أو شيء تريد تذكره.\n"
-            "لو حاب تلغي اضغط «إلغاء ❌»."
-        )
+    notes_text = _format_notes_list(notes)
 
-    cancel_kb = ReplyKeyboardMarkup([[KeyboardButton(BTN_CANCEL)]], resize_keyboard=True)
-    update.message.reply_text(msg, reply_markup=cancel_kb)
+    kb = ReplyKeyboardMarkup(
+        [
+            [KeyboardButton(BTN_NOTE_ADD)],
+            [KeyboardButton(BTN_NOTE_EDIT), KeyboardButton(BTN_NOTE_DELETE)],
+            [KeyboardButton(BTN_CANCEL)],
+        ],
+        resize_keyboard=True,
+    )
+
+    update.message.reply_text(
+        f"📓 ملاحظاتك:\n\n{notes_text}\n\n"
+        "اختر ما تريد فعله من الأزرار 👇",
+        reply_markup=kb,
+    )
 
 
 def handle_reset_counter(update: Update, context: CallbackContext):
@@ -404,7 +429,7 @@ def handle_reset_counter(update: Update, context: CallbackContext):
 
 def handle_contact_support(update: Update, context: CallbackContext):
     user = update.effective_user
-    get_user_record(user)  # للتأكد أنه محفوظ
+    get_user_record(user)
 
     WAITING_FOR_SUPPORT.add(user.id)
 
@@ -412,7 +437,7 @@ def handle_contact_support(update: Update, context: CallbackContext):
 
     update.message.reply_text(
         "✉️ اكتب الآن رسالتك التي تريد إرسالها للدعم.\n"
-        " حاول أن تشرح وضعك أو سؤالك بهدوء… وسنقرأه باهتمام 🤍\n\n"
+        "حاول أن تشرح وضعك أو سؤالك بهدوء… وسنقرأه باهتمام 🤍\n\n"
         "لو حاب تلغي اضغط «إلغاء ❌».",
         reply_markup=cancel_kb,
     )
@@ -516,15 +541,20 @@ def handle_text_message(update: Update, context: CallbackContext):
     msg = update.message
     text = (msg.text or "").strip()
 
-    record = get_user_record(user)  # للتأكد أنه مسجل ومحدَّث
+    record = get_user_record(user)
 
-    # أولاً: زر الإلغاء العام
+    # 1️⃣ زر الإلغاء العام
     if text == BTN_CANCEL:
         WAITING_FOR_SUPPORT.discard(user_id)
         WAITING_FOR_BROADCAST.discard(user_id)
         WAITING_FOR_NOTE.discard(user_id)
+        WAITING_FOR_NOTE_MENU.discard(user_id)
+        WAITING_FOR_NOTE_EDIT.discard(user_id)
+        WAITING_FOR_NOTE_EDIT_TEXT.discard(user_id)
+        WAITING_FOR_NOTE_DELETE.discard(user_id)
         WAITING_FOR_RATING.discard(user_id)
         WAITING_FOR_CUSTOM_START.discard(user_id)
+        NOTE_EDIT_INDEX.pop(user_id, None)
 
         msg.reply_text(
             "تم الإلغاء ✅\nرجعتك للقائمة الرئيسية ✨",
@@ -532,7 +562,7 @@ def handle_text_message(update: Update, context: CallbackContext):
         )
         return
 
-    # ثانياً: رد الأدمن على رسالة فيها ID → يرسل للمستخدم
+    # 2️⃣ رد الأدمن على رسالة فيها ID → يرسل للمستخدم
     if is_admin(user_id) and msg.reply_to_message:
         original = msg.reply_to_message.text or ""
         m = re.search(r"ID:\s*`(\d+)`", original)
@@ -556,7 +586,172 @@ def handle_text_message(update: Update, context: CallbackContext):
                 )
             return
 
-    # ثالثاً: وضع "تواصل مع الدعم" (المستخدم يكتب رسالة دعم)
+    # 3️⃣ قائمة إدارة الملاحظات
+    if user_id in WAITING_FOR_NOTE_MENU:
+        notes = record.get("notes", [])
+
+        if text == BTN_NOTE_ADD:
+            WAITING_FOR_NOTE_MENU.discard(user_id)
+            WAITING_FOR_NOTE.add(user_id)
+            kb = ReplyKeyboardMarkup(
+                [[KeyboardButton(BTN_CANCEL)]],
+                resize_keyboard=True,
+            )
+            msg.reply_text(
+                "📝 أرسل الآن الملاحظة التي تريد حفظها.\n"
+                "لو حاب تلغي اضغط «إلغاء ❌».",
+                reply_markup=kb,
+            )
+            return
+
+        if text == BTN_NOTE_EDIT:
+            if not notes:
+                msg.reply_text(
+                    "📓 لا توجد ملاحظات لتعديلها حاليًا.",
+                    reply_markup=MAIN_KEYBOARD,
+                )
+                WAITING_FOR_NOTE_MENU.discard(user_id)
+                return
+
+            WAITING_FOR_NOTE_MENU.discard(user_id)
+            WAITING_FOR_NOTE_EDIT.add(user_id)
+            notes_text = _format_notes_list(notes)
+            kb = ReplyKeyboardMarkup(
+                [[KeyboardButton(BTN_CANCEL)]],
+                resize_keyboard=True,
+            )
+            msg.reply_text(
+                f"✏️ اختر رقم الملاحظة التي تريد تعديلها:\n\n{notes_text}\n\n"
+                "أرسل الرقم الآن، أو اضغط «إلغاء ❌».",
+                reply_markup=kb,
+            )
+            return
+
+        if text == BTN_NOTE_DELETE:
+            if not notes:
+                msg.reply_text(
+                    "📓 لا توجد ملاحظات لحذفها حاليًا.",
+                    reply_markup=MAIN_KEYBOARD,
+                )
+                WAITING_FOR_NOTE_MENU.discard(user_id)
+                return
+
+            WAITING_FOR_NOTE_MENU.discard(user_id)
+            WAITING_FOR_NOTE_DELETE.add(user_id)
+            notes_text = _format_notes_list(notes)
+            kb = ReplyKeyboardMarkup(
+                [[KeyboardButton(BTN_CANCEL)]],
+                resize_keyboard=True,
+            )
+            msg.reply_text(
+                f"🗑 اختر رقم الملاحظة التي تريد حذفها:\n\n{notes_text}\n\n"
+                "أرسل الرقم الآن، أو اضغط «إلغاء ❌».",
+                reply_markup=kb,
+            )
+            return
+
+        # لو كتب شيء آخر داخل القائمة
+        msg.reply_text(
+            "اختر من الأزرار المتاحة لإدارة ملاحظاتك 👇",
+            reply_markup=ReplyKeyboardMarkup(
+                [
+                    [KeyboardButton(BTN_NOTE_ADD)],
+                    [KeyboardButton(BTN_NOTE_EDIT), KeyboardButton(BTN_NOTE_DELETE)],
+                    [KeyboardButton(BTN_CANCEL)],
+                ],
+                resize_keyboard=True,
+            ),
+        )
+        return
+
+    # 4️⃣ اختيار رقم ملاحظة للتعديل
+    if user_id in WAITING_FOR_NOTE_EDIT:
+        notes = record.get("notes", [])
+        try:
+            idx = int(text) - 1
+            if idx < 0 or idx >= len(notes):
+                raise ValueError()
+        except ValueError:
+            kb = ReplyKeyboardMarkup(
+                [[KeyboardButton(BTN_CANCEL)]],
+                resize_keyboard=True,
+            )
+            msg.reply_text(
+                "رجاءً أرسل رقم صحيح من القائمة، أو اضغط «إلغاء ❌».",
+                reply_markup=kb,
+            )
+            return
+
+        NOTE_EDIT_INDEX[user_id] = idx
+        WAITING_FOR_NOTE_EDIT.discard(user_id)
+        WAITING_FOR_NOTE_EDIT_TEXT.add(user_id)
+
+        kb = ReplyKeyboardMarkup(
+            [[KeyboardButton(BTN_CANCEL)]],
+            resize_keyboard=True,
+        )
+        msg.reply_text(
+            f"✏️ أرسل النص الجديد للملاحظة رقم {idx+1}:",
+            reply_markup=kb,
+        )
+        return
+
+    # 5️⃣ استلام النص الجديد بعد اختيار رقم الملاحظة
+    if user_id in WAITING_FOR_NOTE_EDIT_TEXT:
+        notes = record.get("notes", [])
+        idx = NOTE_EDIT_INDEX.get(user_id)
+        if idx is None or idx < 0 or idx >= len(notes):
+            # لو حصل لخبطة نرجع للقائمة الرئيسية
+            WAITING_FOR_NOTE_EDIT_TEXT.discard(user_id)
+            NOTE_EDIT_INDEX.pop(user_id, None)
+            msg.reply_text(
+                "حصل خطأ بسيط في اختيار الملاحظة، جرّب مرة أخرى من «ملاحظاتي 📓».",
+                reply_markup=MAIN_KEYBOARD,
+            )
+            return
+
+        notes[idx] = text
+        update_user_record(user_id, notes=notes)
+
+        WAITING_FOR_NOTE_EDIT_TEXT.discard(user_id)
+        NOTE_EDIT_INDEX.pop(user_id, None)
+
+        msg.reply_text(
+            "✅ تم تعديل الملاحظة بنجاح.\n"
+            "تقدر ترجع لـ «ملاحظاتي 📓» لو حاب تشوف التغييرات.",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return
+
+    # 6️⃣ اختيار رقم ملاحظة للحذف
+    if user_id in WAITING_FOR_NOTE_DELETE:
+        notes = record.get("notes", [])
+        try:
+            idx = int(text) - 1
+            if idx < 0 or idx >= len(notes):
+                raise ValueError()
+        except ValueError:
+            kb = ReplyKeyboardMarkup(
+                [[KeyboardButton(BTN_CANCEL)]],
+                resize_keyboard=True,
+            )
+            msg.reply_text(
+                "رجاءً أرسل رقم صحيح من القائمة، أو اضغط «إلغاء ❌».",
+                reply_markup=kb,
+            )
+            return
+
+        deleted = notes.pop(idx)
+        update_user_record(user_id, notes=notes)
+        WAITING_FOR_NOTE_DELETE.discard(user_id)
+
+        msg.reply_text(
+            f"🗑 تم حذف الملاحظة:\n\n{deleted}",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return
+
+    # 7️⃣ وضع "تواصل مع الدعم"
     if user_id in WAITING_FOR_SUPPORT:
         WAITING_FOR_SUPPORT.discard(user_id)
 
@@ -583,7 +778,7 @@ def handle_text_message(update: Update, context: CallbackContext):
         )
         return
 
-    # رابعاً: وضع "رسالة جماعية" (للأدمن فقط)
+    # 8️⃣ وضع "رسالة جماعية"
     if user_id in WAITING_FOR_BROADCAST:
         WAITING_FOR_BROADCAST.discard(user_id)
 
@@ -611,9 +806,8 @@ def handle_text_message(update: Update, context: CallbackContext):
         )
         return
 
-    # خامساً: وضع "ملاحظاتي"
+    # 9️⃣ وضع "إضافة ملاحظة جديدة"
     if user_id in WAITING_FOR_NOTE:
-        # هنا نتعامل مع النص كملاحظة حقيقية
         notes = record.get("notes", [])
         notes.append(text)
         update_user_record(user_id, notes=notes)
@@ -626,7 +820,7 @@ def handle_text_message(update: Update, context: CallbackContext):
         WAITING_FOR_NOTE.discard(user_id)
         return
 
-    # سادساً: وضع "تقييم اليوم"
+    # 🔟 وضع "تقييم اليوم"
     if user_id in WAITING_FOR_RATING:
         if text not in {"1", "2", "3", "4", "5"}:
             msg.reply_text(
@@ -660,7 +854,7 @@ def handle_text_message(update: Update, context: CallbackContext):
         WAITING_FOR_RATING.discard(user_id)
         return
 
-    # سابعاً: وضع "تعيين بداية التعافي"
+    # 1️⃣1️⃣ وضع "تعيين بداية التعافي"
     if user_id in WAITING_FOR_CUSTOM_START:
         try:
             days = int(text)
@@ -688,7 +882,7 @@ def handle_text_message(update: Update, context: CallbackContext):
         WAITING_FOR_CUSTOM_START.discard(user_id)
         return
 
-    # ثامناً: رد المستخدم على رسالة من البوت (دعم/رسالة جماعية)
+    # 1️⃣2️⃣ رد المستخدم على رسالة من البوت (دعم/رسالة جماعية)
     if (
         not is_admin(user_id)
         and msg.reply_to_message
@@ -698,7 +892,6 @@ def handle_text_message(update: Update, context: CallbackContext):
         if original_text.startswith("📢 رسالة من الدعم") or original_text.startswith(
             "💌 رد من الدعم"
         ):
-            # اعتبره ردّ دعم يُرسل للأدمن
             support_msg = (
                 "📩 *رد جديد على رسالة الدعم/الرسالة الجماعية:*\n\n"
                 f"👤 الاسم: {user.full_name}\n"
@@ -724,7 +917,7 @@ def handle_text_message(update: Update, context: CallbackContext):
             )
             return
 
-    # تاسعاً: الأزرار الرئيسية
+    # 1️⃣3️⃣ الأزرار الرئيسية
     if text == BTN_START:
         start_command(update, context)
         return
@@ -765,7 +958,7 @@ def handle_text_message(update: Update, context: CallbackContext):
         handle_set_start_button(update, context)
         return
 
-    # عاشراً: أي رسالة عشوائية ليست وضع خاص ولا زر → تنبيه فقط
+    # 1️⃣4️⃣ أي رسالة عشوائية ليست زر ولا وضع خاص → تنبيه
     msg.reply_text(
         "⚠️ تنبيه: رسالتك هذه لا تصل للأدمن بشكل مباشر.\n"
         "لو حاب تتواصل مع الدعم:\n"
@@ -789,12 +982,12 @@ def main():
     dp.add_handler(CommandHandler("start", start_command))
     dp.add_handler(CommandHandler("help", help_command))
 
-    # جميع الرسائل النصية (بعد الأوامر)
+    # جميع الرسائل النصية
     dp.add_handler(
         MessageHandler(Filters.text & ~Filters.command, handle_text_message)
     )
 
-    # جدولة التذكير اليومي (مثال: 20:00 بتوقيت UTC)
+    # تذكير يومي الساعة 20:00 بتوقيت UTC
     job_queue.run_daily(
         send_daily_reminders,
         time=time(hour=20, minute=0, tzinfo=pytz.UTC),
